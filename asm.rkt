@@ -692,6 +692,18 @@
        (block-append-instr! u block (jmp label))]
       [_ #f])))
 
+(define (trivial-copy u registers-ed)
+  (define-values (register set-register!) (use-extra-data registers-ed))
+  (define (trivial? instr)
+    (match (vinstr-op instr)
+      [(copy src dst)
+       (equal? (register src) (register dst))]
+      [_ #t]))
+  (for* ([block (unit-blocks u)]
+         [instr (block-instrs block)])
+    (when (trivial? instr)
+      (block-delete-instr! block instr))))
+
 
 
 
@@ -817,6 +829,8 @@
                                  (spill . #f))))
     (show-unit u allocs)
     (unphi u allocs (phi-registers u))
+    (show-unit u allocs)
+    (trivial-copy u allocs)
     (show-unit u allocs)
     ))
 
