@@ -4,42 +4,67 @@
 
 (provide color)
 
-(define (neighbors g v)
-  (vector-ref g v))
-
-(define (reverse-lex-bfs g)
-  (define g-sets
-    (vector-map (lambda (l) (list->seteq l)) g))
-  (define (neighbors-set v)
-    (vector-ref g-sets v))
-  (define n (vector-length g))
-
-  (if (= 0 n)
-      '()
-      (let loop ([sets (list (list->seteq (sequence->list (in-range n))))])
-        (if (empty? sets)
-            empty-stream
-            (let* ([v (set-first (first sets))]
-                   [neighbors (neighbors-set v)]
-                   [new-sets
-                    (filter-not set-empty?
-                                (append* (for/list ([set sets])
-                                           (list (set-intersect set neighbors)
-                                                 (set-subtract set neighbors (seteq v))))))])
-              (stream-cons v (loop new-sets)))))))
-
-(define (color g n)
+(define (color g n [match-weights #f])
   (define available-colors (build-vector (vector-length g) (lambda (_) (for/mutable-seteq ([color (in-range n)]) color))))
   (define colors (make-vector (vector-length g) #f))
 
-  (for ([v (reverse-lex-bfs g)])
+  (define (match-weight v w)
+    (cond
+      [(false? match-weights) 0]
+      [else (vector-ref (vector-ref match-weights v) w)]))
+
+  (define (neighbors g v)
+    (vector-ref g v))
+
+  (define (select-color v)
     (define available (vector-ref available-colors v))
-    (when (set-empty? available)
-      (error 'color "Could not ~a-color graph: ~a" n g))
-    (define c (set-first available))
-    (set-clear! available)
+    (define ret (for/first ([c (in-range n)]
+                            #:when (set-member? available c))
+                  c))
+    (when (not ret) (error 'color "Could not ~a-color graph: ~a" n g))
+    ret)
+
+  (define (select-next-node eligible)
+    (define weights (for/list ([v eligible])
+                      (define c* (select-color v))
+                      (define matches (filter identity
+                                              (for/list ([w (in-range (vector-length g))])
+                                                (and (equal? c* (vector-ref colors w))
+                                                    (cons w (match-weight v w))))))
+                      (cond
+                        [(empty? matches) (cons #f 0)]
+                        [else
+                         (cons v (cdr (argmax cdr matches)))])))
+    (match (argmax cdr weights)
+      [(cons #f _) (set-first eligible)]
+      [(cons v weight) v]))
+
+  (define (reverse-lex-bfs)
+    (define g-sets (vector-map (lambda (l) (list->seteq l)) g))
+    (define (neighbors-set v)
+      (vector-ref g-sets v))
+    (define n (vector-length g))
+
+    (if (= 0 n)
+        '()
+        (let loop ([sets (list (list->seteq (sequence->list (in-range n))))])
+          (if (empty? sets)
+              empty-stream
+              (let* ([v (select-next-node (first sets))]
+                     [neighbors (neighbors-set v)]
+                     [new-sets
+                      (filter-not set-empty?
+                                  (append* (for/list ([set sets])
+                                             (list (set-intersect set neighbors)
+                                                   (set-subtract set neighbors (seteq v))))))])
+                (stream-cons v (loop new-sets)))))))
+
+
+  (for ([v (reverse-lex-bfs)])
+    (define c (select-color v))
     (for ([neigh (neighbors g v)])
       (set-remove! (vector-ref available-colors neigh) c))
+    (set-clear! (vector-ref available-colors v))
     (vector-set! colors v c))
 
   colors)
@@ -126,7 +151,7 @@
 #;(check ([graph arbitrary-chordal-graph])
        (color graph (max-clique graph)))
 
-(module+ test
+#;(module+ test
   (define g0
     (vector '(1 2 3)
             '(0 2 3)

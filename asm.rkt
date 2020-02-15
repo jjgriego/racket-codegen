@@ -489,6 +489,25 @@
     (for ([block (unit-blocks u)])
       (fix-block! block))))
 
+(define (phi-registers u)
+  (define phi-regs-ed (make-extra-block-data u))
+  (define-values (phi-regs set-phi-regs!) (use-extra-data phi-regs-ed))
+
+  (for ([label (unit-labels u)])
+    (define block (label-block label))
+    (set-phi-regs! block (make-vector (label-arity label) #f)))
+
+  (for ([block (unit-blocks u)])
+    (for ([instr (block-instrs block)])
+      (match (vinstr-op instr)
+        [(phi dst idx)
+         (assert (< idx (vector-length (phi-regs block))))
+         (vector-set! (phi-regs block) idx dst)]
+        [_ #f])))
+
+  phi-regs-ed)
+
+
 ;; the graph coloring failed for immediately following the
 ;; provided instruction, or at block entry if instr is #f
 (struct alloc-failure (block instr cls live-regs spills-needed) #:transparent)
@@ -497,12 +516,14 @@
 
 (define (try-regalloc u
                       available-regs
+                      [phi-regs-ed (phi-registers u)]
                       [preds-ed (predecessors u)]
                       [live-ed (liveness u preds-ed)]
                       [storage-class-ed (storage-classes u)])
   (define-values (storage-class set-storage-class!) (use-extra-data storage-class-ed))
+  (define-values (phi-registers set-phi-registers!) (use-extra-data phi-regs-ed))
 
-  (struct iference-graph (label->idx adjacency chromatic-number) #:transparent #:mutable)
+  (struct iference-graph (label->idx adjacency preference-weights chromatic-number) #:transparent #:mutable)
 
   ;; construct an interference graph for each register class
   (define interference-graphs
@@ -520,7 +541,10 @@
          (define lookup (for/hasheq ([r members]
                                    [idx (in-naturals)])
                           (values r idx)))
-         (values cls (iference-graph lookup (make-vector (length members) (list)) 1))])))
+         (values cls (iference-graph lookup
+                                     (make-vector (length members) (list))
+                                     (build-vector (length members) (lambda (_) (make-vector (length members) 0)))
+                                     1))])))
 
   ;; mark two vregs as being live at the same moment
   (define (add!-interferes-with graph v w)
@@ -529,6 +553,20 @@
     (when (not (eq? v w))
       (vector-set! adj (idx v) (set-add (vector-ref adj (idx v)) (idx w)))
       (vector-set! adj (idx w) (set-add (vector-ref adj (idx w)) (idx v)))))
+
+  (define (add!-affinity graph v w)
+    (define weights (iference-graph-preference-weights graph))
+    (define mapping (iference-graph-label->idx graph))
+    (define vi (hash-ref mapping v #f))
+    (define wi (hash-ref mapping w #f))
+    (when (and vi wi)
+      (vector-set! (vector-ref weights vi) wi (add1 (vector-ref (vector-ref weights vi) wi)))
+      (vector-set! (vector-ref weights wi) vi (add1 (vector-ref (vector-ref weights wi) vi)))))
+
+  (define (affinity v w)
+    (for ([(cls graph) (in-dict interference-graphs)])
+      (when graph
+        (add!-affinity graph v w))))
 
   (define (visit-live regs block instr)
     (define (live-regs-with-class cls)
@@ -568,6 +606,14 @@
        (for/fold ([live-out (seteq)])
                  ([instr (reverse (block-instrs block))])
          (define live-in (instr-liveness instr live-out block-live-regs))
+
+         (match (vinstr-op instr)
+           [(phijmp target srcs)
+            (define phi-regs (phi-registers (label-block target)))
+            (for ([dst phi-regs]
+                  [src srcs])
+              (affinity dst src))]
+           [_ (void)])
          ;; all regs live out of the instr interfere with one another
          (visit-live live-out block instr)
          live-in))
@@ -583,9 +629,9 @@
 
    (define (assign-registers graph num-colors color->register)
      (match graph
-       [(iference-graph label->idx adjacency chromatic-number)
+       [(iference-graph label->idx adjacency prefs chromatic-number)
         (assert (<= chromatic-number num-colors))
-        (define colors (color adjacency num-colors))
+        (define colors (color adjacency num-colors prefs))
         (for ([(vreg idx) label->idx])
           (set-register! vreg (color->register (vector-ref colors idx))))]))
 
@@ -626,6 +672,7 @@
       (loop live-ed*))
     (match (try-regalloc u
                          available-regs
+                         (phi-registers u)
                          preds-ed
                          live-ed
                          storage-classes-ed)
@@ -653,24 +700,6 @@
        (spill-and-retry
         (take eligible-regs num-to-spill))]
       [register-assignments register-assignments])))
-
-(define (phi-registers u)
-  (define phi-regs-ed (make-extra-block-data u))
-  (define-values (phi-regs set-phi-regs!) (use-extra-data phi-regs-ed))
-
-  (for ([label (unit-labels u)])
-    (define block (label-block label))
-    (set-phi-regs! block (make-vector (label-arity label) #f)))
-
-  (for ([block (unit-blocks u)])
-    (for ([instr (block-instrs block)])
-      (match (vinstr-op instr)
-        [(phi dst idx)
-         (assert (< idx (vector-length (phi-regs block))))
-         (vector-set! (phi-regs block) idx dst)]
-        [_ #f])))
-
-  phi-regs-ed)
 
 (define (shuffle make-spare register regs-in regs-out)
   (define renames (for/list ([in regs-in] [out regs-out])
@@ -919,7 +948,7 @@
     (storage-classes u st-classes)
     (show-unit u st-classes)
     (define available-regs '((sf . (sf))
-                             (gp . (rax rbx rcx rdx rsi rdi r8 r9 r10))
+                             (gp . (rax rbx rcx rdx rsi rdi))
                              (spill . #f)))
     (define allocs (regalloc u available-regs))
     (show-unit u allocs)
