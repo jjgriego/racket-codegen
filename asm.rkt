@@ -663,11 +663,77 @@
 
   phi-regs-ed)
 
+(define (shuffle make-spare register regs-in regs-out)
+  (define renames (for/list ([in regs-in] [out regs-out])
+                    (cons in out)))
+  (define spare (box #f))
+  (let loop ([renames renames]
+             [rev-order '()])
+
+    (define (spare-reg)
+      (or (unbox spare)
+          (let ([sp (make-spare)])
+            (set-box! spare sp)
+            sp)))
+
+    (define (next-cycle remaining candidate chain)
+      ;; candidate: D->A
+      ;; chain: A->B B->C C->D
+      (define conflict
+        (for/or ([r renames])
+          (and (not (eq? r candidate))
+               (equal? (register (car r))
+                       (register (cdr candidate)))
+               r)))
+      (cond
+        [(and conflict
+              (not (empty? chain))
+              (eq? (car chain) conflict))
+         ;; we have a cycle--allocate the spare register if we need
+         (define spare (spare-reg))
+         ;; move the conflict's src to the spare,
+         ;; then exec the candidate, then (after the rest of the cycle is resolved)
+         ;; move the spare to the conflict's dest
+         (values remaining
+                 (append
+                  (list (cons spare (cdr (car chain))))
+                  (cdr chain)
+                  (list
+                   candidate
+                   (cons (car (car chain)) spare))))]
+        [conflict
+         ;; we have a conflict but it doesn't form a cycle
+         (next-cycle (remove conflict remaining eq?)
+                     conflict
+                     (append chain (list candidate)))]
+        [else
+         ;; no conflict--we can execute the current chain of renames
+         (values
+          remaining
+          (append
+           chain
+           (list candidate)))]))
+
+    (match renames
+      ['()
+       (for/list ([r (reverse rev-order)]
+                  #:when (not (equal? (register (car r))
+                                      (register (cdr r)))))
+         (copy (car r) (cdr r)))]
+      [(cons r rs)
+       (define-values (remaining cyc) (next-cycle rs r '()))
+       (loop remaining
+             (append cyc rev-order))])))
+
 (define (unphi u
+               available-regs
+               block-live-ed
                registers-ed
                phi-regs-ed)
+  (define-values (block-live set-block-live!) (use-extra-data block-live-ed))
   (define-values (register set-register!) (use-extra-data registers-ed))
   (define-values (phi-regs set-phi-regs!) (use-extra-data phi-regs-ed))
+
   (for ([block (unit-blocks u)])
     ;; delete all the leading phis
     (for ([instr (block-instrs block)])
@@ -685,10 +751,29 @@
        (define regs (phi-regs (label-block label)))
        (assert (= (vector-length regs) (length srcs)))
        (block-delete-instr! block last-i)
-       (for ([src srcs]
-             [dst regs])
-         (unless (eq? src dst)
-           (block-append-instr! u block (copy src dst))))
+       ;; select a spare vreg for this block
+       (define (make-spare)
+         (define (find-free)
+          (define gps (dict-ref available-regs 'gp))
+          ;; this is overly pessimistic since we might be able to use one of the dst
+          ;; registers if only part of the shuffle is a permutation, but alas
+          (define live (set-union (for/set ([r (block-live (label-block label))]) (register r))
+                                  (list->set (map register srcs))
+                                  (for/set ([dst regs]) (register dst))))
+          (match (for/first ([r gps]
+                              #:when (not (set-member? live r)))
+                    r)
+            [#f
+              ;; fine! we'll use a spill
+             (for/first ([idx (in-naturals)]
+                                     #:when (not (set-member? live (virtual-reg 'spill idx))))
+                          (virtual-reg 'spill idx))]
+            [gp gp]))
+         (define vreg (vreg! u))
+         (set-register! vreg (find-free))
+         vreg)
+       (for ([cpy (shuffle make-spare register srcs regs)])
+         (block-append-instr! u block cpy))
        (block-append-instr! u block (jmp label))]
       [_ #f])))
 
@@ -698,7 +783,7 @@
     (match (vinstr-op instr)
       [(copy src dst)
        (equal? (register src) (register dst))]
-      [_ #t]))
+      [_ #f]))
   (for* ([block (unit-blocks u)]
          [instr (block-instrs block)])
     (when (trivial? instr)
@@ -824,14 +909,15 @@
     #;(spill u (list (spill-spec n1 b1)) st-classes)
     (storage-classes u st-classes)
     (show-unit u st-classes)
-    (define allocs (regalloc u '((sf . (sf))
-                                 (gp . (one two))
-                                 (spill . #f))))
+    (define available-regs '((sf . (sf))
+                             (gp . (rax rbx rcx))
+                             (spill . #f)))
+    (define allocs (regalloc u available-regs))
     (show-unit u allocs)
-    (unphi u allocs (phi-registers u))
+    (unphi u available-regs (liveness u) allocs (phi-registers u))
     (show-unit u allocs)
-    (trivial-copy u allocs)
-    (show-unit u allocs)
+    #;(trivial-copy u allocs)
+    #;(show-unit u allocs)
     ))
 
 
