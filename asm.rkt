@@ -1,6 +1,7 @@
 #lang racket
 
 (require racket/generic
+         racket/control
          [for-syntax
           racket
           racket/syntax
@@ -13,7 +14,8 @@
   (instr-srcs instr)
   (instr-dsts instr)
   (instr-imms instr)
-  (instr-targets instr))
+  (instr-targets instr)
+  (instr-visit-operands instr f))
 
 (define-syntax (assert stx)
   (syntax-case stx ()
@@ -32,6 +34,8 @@
      (define field-names (generate-temporaries #'(type ...)))
      (define field-accessors (for/list ([field field-names])
                                (format-id #'name "~a-~a" #'name field)))
+     (define field-setters (for/list ([field field-names])
+                               (format-id #'name "set-~a-~a!" #'name field)))
 
      (define (filter-accessors which)
        (for/list ([type fields]
@@ -41,6 +45,7 @@
 
      (with-syntax ([(field-name ...) field-names]
                    [(accessor ...) field-accessors]
+                   [(setter ...) field-setters]
                    [(src-accessor ...) (filter-accessors 'src)]
                    [(dst-accessor ...) (filter-accessors 'dst)]
                    [(imm-accessor ...) (filter-accessors 'imm)]
@@ -52,6 +57,8 @@
             (define (instr-srcs i) (list (src-accessor i) ...))
             (define (instr-dsts i) (list (dst-accessor i) ...))
             (define (instr-imms i) (list (imm-accessor i) ...))
+            (define (instr-visit-operands i f)
+              (f 'type (accessor i) (lambda (x) (setter i x))) ...)
             (define (instr-targets i) (list (target-accessor i) ...))]))]))
 
 (define-instruction (conjure dst))
@@ -62,16 +69,9 @@
 (define-instruction (jmp target))
 (define-instruction (copy src dst))
 (define-instruction (ret src))
+(define-instruction (phi dst imm))
 
 ;; ssa-specific nonsense
-(struct phi (dst idx srcs) #:mutable #:transparent
-  #:methods gen:instr
-  [(define (instr-mneumonic _) 'phi)
-   (define (instr-operands i) (list* (phi-dst i) (phi-srcs i)))
-   (define (instr-srcs i) (phi-srcs i))
-   (define (instr-dsts i) (list (phi-dst i)))
-   (define (instr-imms i) (list (phi-idx i)))
-   (define (instr-targets i) '())])
 (struct phijmp (target srcs) #:mutable #:transparent
   #:methods gen:instr
   [(define (instr-mneumonic _) 'phijmp)
@@ -79,7 +79,21 @@
    (define (instr-srcs i) (phijmp-srcs i))
    (define (instr-dsts i) '())
    (define (instr-imms i) '())
-   (define (instr-targets i) (list (phijmp-target i)))])
+   (define (instr-targets i) (list (phijmp-target i)))
+   (define (instr-visit-operands i f)
+     (f 'target (phijmp-target i) (lambda (x) (set-phijmp-target! i x)))
+     (define ((update-srcs-at! idx) x)
+       (set-phijmp-srcs! i (list-set (phijmp-srcs i) idx x)))
+     (for ([src (phijmp-srcs i)]
+           [i (in-naturals)])
+       (f 'src src (update-srcs-at! i))))])
+
+(define (instr-rename-vreg! ins old-reg new-reg)
+  (instr-visit-operands ins
+                        (lambda (type val set-val!)
+                          (when (and (vreg? val) (eq? old-reg val))
+                            (set-val! new-reg)))))
+
 
 ;; vasm datastructure
 (struct unit (labels blocks vregs instrs) #:transparent #:mutable)
@@ -90,36 +104,48 @@
 
 
 ;; extra data
-(struct extra-data (kind guard struct-id contents) #:transparent #:mutable)
+(struct extra-data (kind guard struct-id contents default) #:transparent #:mutable)
 
 (define (make-extra-block-data u [default-value #f])
   (extra-data 'block
               block?
               block-id
-              (build-list (length (unit-blocks u)) (lambda (_) (box default-value)))))
+              (build-list (length (unit-blocks u)) (lambda (_) (box default-value)))
+              default-value))
 
 (define (make-extra-instr-data u [default-value #f])
   (extra-data 'instr
               vinstr?
               vinstr-id
-              (build-list (length (unit-instrs u)) (lambda (_) (box default-value)))))
+              (build-list (length (unit-instrs u)) (lambda (_) (box default-value)))
+              default-value))
 
 (define (make-extra-vreg-data u [default-value #f])
   (extra-data 'vreg
               vreg?
               vreg-id
-              (build-list (length (unit-vregs u)) (lambda (_) (box default-value)))))
+              (build-list (length (unit-vregs u)) (lambda (_) (box default-value)))
+              default-value))
+
+(define (extra-data-ref-raw xd x)
+  (match xd
+    [(extra-data kind pred? struct-id contents default)
+     (unless (pred? x)
+       (error 'extra-data "failed extra-data guard"))
+     (define id (struct-id x))
+     (cond
+       [(< id (length contents)) (list-ref contents id)]
+       [else
+        (define difference (- (add1 id) (length contents)))
+        (define contents* (append contents (build-list difference (lambda (_) (box default)))))
+        (set-extra-data-contents! xd contents*)
+        (list-ref contents* id)])]))
 
 (define (extra-data-ref xd x)
-  (unless ((extra-data-guard xd) x)
-    (error 'extra-data "failed extra-data guard"))
-  (unbox (list-ref (extra-data-contents xd) ((extra-data-struct-id xd) x))))
+  (unbox (extra-data-ref-raw xd x)))
 
 (define (extra-data-set! xd x val)
-  (unless ((extra-data-guard xd) x)
-    (error 'extra-data-set! "failed extra-data guard"))
-  (set-box! (list-ref (extra-data-contents xd) ((extra-data-struct-id xd) x))
-            val))
+  (set-box! (extra-data-ref-raw xd x) val))
 
 (define (use-extra-data xd)
   (values (lambda (x) (extra-data-ref xd x))
@@ -163,12 +189,35 @@
   (set-unit-labels! unit (append labels (list new-label)))
   new-label)
 
-(define (instr! unit block ins)
+(define (instr-raw! unit ins)
   (define all-instrs (unit-instrs unit))
-  (define instrs (block-instrs block))
   (define new-instr (vinstr (length all-instrs) ins))
+  (set-unit-instrs! unit (append all-instrs (list new-instr)))
+  new-instr)
+
+(define (instr! unit block ins)
+  (define instrs (block-instrs block))
+  (define new-instr (instr-raw! unit ins))
   (set-block-instrs! block (append instrs (list new-instr)))
-  (set-unit-instrs! unit (append all-instrs (list new-instr))))
+  new-instr)
+
+(define (block-insert-instr! u block instr [i 0])
+  (define-values (before after) (split-at (block-instrs block) i))
+  (define new-instr (instr-raw! u instr))
+  (define instrs (append before (cons new-instr after)))
+  (set-block-instrs! block instrs)
+  new-instr)
+
+(define (block-instr-idx block instr)
+  (index-where
+   (block-instrs block)
+   (lambda (i) (eq? i instr))))
+
+(define (find-def u reg)
+  (for/or ([block (unit-blocks u)])
+    (for/first ([instr (block-instrs block)]
+                #:when (memq reg (instr-dsts (vinstr-op instr))))
+      (cons block instr))))
 
 (define (block-successors block)
   (sequence-map label-block (apply sequence-append (map (compose instr-targets vinstr-op) (block-instrs block)))))
@@ -240,7 +289,7 @@
      ;; if we're returning from this block (which must be the last instruction)
      ;; then only the result register is live
      (seteq reg)]
-    [(phi dst idx srcs)
+    [(phi dst idx)
      ;; phis only mark their dest as dead beforehand--the phijmp is the src that
      ;; will mark the input register(s) as live beforehand
      (set-remove live-out dst)]
@@ -318,10 +367,8 @@
         ;; phis are really copies we'd like to be able to optimize away--in
         ;; particular it's possible for a spilled vreg to be the dst or a
         ;; src of a phi
-        [(phi dst _ srcs)
-         (refine! dst 'word)
-         (for ([src srcs])
-           (refine! src 'word))]
+        [(phi dst _)
+         (refine! dst 'word)]
         ;; phijmps permit spills also for the same reason
         [(phijmp _ srcs)
          (for ([src srcs]) (refine! src 'word))]
@@ -333,63 +380,260 @@
            (refine! src 'gp))])))
   storage-class-ed)
 
-#;(define (spill u spilled storage-class-ed)
+;; visit all the blocks reachable from this one
+(define (reachable-blocks u block)
+  (define queue (list block))
+  (define visited (mutable-seteq block))
+  (let loop ([queue (list block)])
+    (match queue
+      [(cons b bs)
+       (set! queue bs)
+       (for ([instr (block-instrs b)])
+         (for ([target (instr-targets (vinstr-op instr))])
+           (define block* (label-block target))
+           (when (not (set-member? visited block*))
+             (set-add! visited block*)
+             (set! queue (append queue (list block*))))))
+       (stream-cons b (loop queue))]
+      [_ empty-stream])))
+
+(define (spill u spilled storage-class-ed)
   (define-values (storage-class set-storage-class!) (use-extra-data storage-class-ed))
-  (define spill-regs (build-list (length spilled) (lambda () (vreg! u))))
-  (set-storage-class! spill-reg 'spill)
+
+
+  (define (spilled-vregs regs)
+    (filter (lambda (reg)
+              (define idx (index-where spilled
+                                       (lambda (spill-reg)
+                                         (eq? spill-reg reg))))
+              (and idx (cons reg idx)))
+            regs))
 
   ;; the def of the spilled vreg is followed by a copy into the spill register
+  (for ([spilled-reg spilled])
+    (define def-location (find-def u spilled-reg))
+    (assert def-location)
+    (define def-block (car def-location))
+    (define def-instr (cdr def-location))
 
-  ;; each use of the spilled vreg is replaced with a copy from the spill reg to a fresh reg
-  )
+    (define slot (vreg! u))
+    (set-storage-class! slot 'spill)
 
-(define (regalloc unit
-                  available-regs
-                  [preds-ed (predecessors unit)]
-                  [live-ed (liveness unit preds-ed)])
-  (define alloc-ed (make-extra-vreg-data unit))
-  (define-values (allocs set-alloc!) (use-extra-data alloc-ed))
+    ;; immediately after the dst (or in the dst if it's a copy or phi)
+    ;; copy to the spill slot
+    (define def-idx (block-instr-idx def-block def-instr))
+    (define spill-instr
+      (let ([i (vinstr-op def-instr)])
+        (match i
+          [(phi dst _)
+           #:when (eq? dst spilled-reg)
+           (instr-rename-vreg! i dst slot)
+           def-instr]
+          [(copy _ dst)
+           #:when (eq? dst spilled-reg)
+           (instr-rename-vreg! i dst slot)
+           def-instr]
+          [_
+           #:when (memq spilled-reg (instr-dsts i))
+           (block-insert-instr! u def-block
+                                (copy spilled-reg slot)
+                                (add1 def-idx))]
+          [_ #f])))
+    (assert spill-instr)
 
-  (define interference (make-vector (length (unit-vregs unit)) (list)))
-  (define chromatic-number 0)
+    (define (fix-instr! b idx)
+      (define vi (list-ref (block-instrs b) idx))
+      (define ins (vinstr-op vi))
+      (unless (eq? spill-instr vi)
+        (match ins
+          ;; phijmp and copy can just substitute the src
+          [(phijmp _ srcs)
+          #:when (memq spilled-reg srcs)
+          (instr-rename-vreg! ins spilled-reg slot)]
+          [(copy src _ )
+          #:when (eq? src spilled-reg)
+          (instr-rename-vreg! ins spilled-reg slot)]
+          ;; other instructions using the spilled reg as a slot
+          ;; need to have a copy inserted to reload the spill
+          [_
+          #:when (memq spilled-reg (instr-srcs ins))
+          (define r (vreg! u))
+          (block-insert-instr! u b (copy slot r) idx)
+          (instr-rename-vreg! ins spilled-reg r)]
+          [_ (void)])))
+
+    ;; XXX: kludgy iteration b/c we modify the block as we traverse it
+    (define (fix-block! b [start 0])
+      (for ([idx (in-naturals start)])
+        #:break (>= idx (length (block-instrs b)))
+        (fix-instr! b idx)))
+
+    (for ([block (unit-blocks u)])
+      (fix-block! block))))
+
+;; the graph coloring failed for immediately following the
+;; provided instruction, or at block entry if instr is #f
+(struct alloc-failure (block instr cls live-regs spills-needed) #:transparent)
+
+(struct virtual-reg (cls idx) #:prefab)
+
+(define (try-regalloc u
+                      available-regs
+                      [preds-ed (predecessors u)]
+                      [live-ed (liveness u preds-ed)]
+                      [storage-class-ed (storage-classes u)])
+  (define-values (storage-class set-storage-class!) (use-extra-data storage-class-ed))
+
+  (struct iference-graph (label->idx adjacency chromatic-number) #:transparent #:mutable)
+
+  ;; construct an interference graph for each register class
+  (define interference-graphs
+    (for/hasheq ([(cls spec) (in-dict available-regs)])
+      ;; empty list is an invalid register spec
+      (assert (or (false? spec) (not (empty? spec))))
+      ;; if there's only a single register of this class, don't bother
+      ;; with the graph coloring algorithm--just assert that only one is live at a time
+
+      (cond
+        [(and spec (= 1 (length spec)))
+         (values cls #f)]
+        [else
+         (define members (filter (lambda (r) (eq? cls (storage-class r))) (unit-vregs u)))
+         (define lookup (for/hasheq ([r members]
+                                   [idx (in-naturals)])
+                          (values r idx)))
+         (values cls (iference-graph lookup (make-vector (length members) (list)) 1))])))
+
   ;; mark two vregs as being live at the same moment
-  (define (add!-interferes-with v w)
+  (define (add!-interferes-with graph v w)
+    (define (idx r) (hash-ref (iference-graph-label->idx graph) r))
+    (define adj (iference-graph-adjacency graph))
     (when (not (eq? v w))
-      (vector-set! interference (vreg-id v) (set-add (vector-ref interference (vreg-id v)) (vreg-id w)))
-      (vector-set! interference (vreg-id w) (set-add (vector-ref interference (vreg-id w)) (vreg-id v)))))
-  (define (add!-live-interference regs)
-    (define size (set-count regs))
-    (set! chromatic-number (max chromatic-number size))
-    (for* ([v regs] [w regs]) (add!-interferes-with v w)))
-  (define block-live-regs (use-extra-data-ref live-ed))
-  (for ([block (unit-blocks unit)])
-    ;; we're going to walk the instructions in the block backwards
-    ;; and materialize the interference graph as we go--
-    (define block-live-in
-      (for/fold ([live-out (seteq)])
-                ([instr (reverse (block-instrs block))])
-        (define live-in (instr-liveness instr live-out block-live-regs))
-        ;; all regs live out of the instr interfere with one another
-        (add!-live-interference live-out)
-        live-in))
-    ;; we should have reached the same result as the
-    ;; block-level liveness analysis
-    (assert (equal? block-live-in (block-live-regs block)))
-    ;; all vregs live at block entry interfere
-    (add!-live-interference block-live-in))
+      (vector-set! adj (idx v) (set-add (vector-ref adj (idx v)) (idx w)))
+      (vector-set! adj (idx w) (set-add (vector-ref adj (idx w)) (idx v)))))
 
-  (assert (< chromatic-number (length available-regs)))
-  (define colors (color interference (length available-regs)))
-  (for ([i (in-naturals)]
-        [c colors])
-    (set-alloc! (list-ref (unit-vregs unit) i)
-                (list-ref available-regs c)))
-  alloc-ed)
+  (define (visit-live regs block instr)
+    (define (live-regs-with-class cls)
+      (filter (lambda (r) (eq? cls (storage-class r)))
+              (set->list regs)))
+
+    (define (interference-set regs graph)
+      (set-iference-graph-chromatic-number! graph
+                                            (max (length regs)
+                                                 (iference-graph-chromatic-number graph)))
+      (for* ([v regs] [w regs]) (add!-interferes-with graph v w)))
+
+    ;; for each register class
+    (for ([(cls spec) (in-dict available-regs)])
+      (define live-set (live-regs-with-class cls))
+      (define graph (hash-ref interference-graphs cls))
+      (cond
+        [(false? spec)
+         ;; the number of registers here is unbounded, just color them
+         (interference-set live-set graph)]
+        [(= 1 (length spec))
+         ;; we have exactly one register so don't fuck around w/ the graph
+         (when (> (length live-set) 1)
+           (abort (alloc-failure block instr cls live-set (sub1 (length live-set)))))]
+        [else
+         (when (> (length live-set) (length spec))
+           (abort (alloc-failure block instr cls live-set (-  (length live-set) (length spec)))))
+         (interference-set live-set graph)])))
+
+  ;; visit the whole unit and track liveness
+  (define block-live-regs (use-extra-data-ref live-ed))
+  (prompt
+   (for ([block (unit-blocks u)])
+     ;; we're going to walk the instructions in the block backwards
+     ;; and materialize the interference graph as we go--
+     (define block-live-in
+       (for/fold ([live-out (seteq)])
+                 ([instr (reverse (block-instrs block))])
+         (define live-in (instr-liveness instr live-out block-live-regs))
+         ;; all regs live out of the instr interfere with one another
+         (visit-live live-out block instr)
+         live-in))
+     ;; we should have reached the same result as the
+     ;; block-level liveness analysis
+     (assert (equal? block-live-in (block-live-regs block)))
+     ;; all vregs live at block entry interfere
+     (visit-live block-live-in block #f))
+
+   ;; now color every register
+   (define register-ed (make-extra-vreg-data u))
+   (define-values (register set-register!) (use-extra-data register-ed))
+
+   (define (assign-registers graph num-colors color->register)
+     (match graph
+       [(iference-graph label->idx adjacency chromatic-number)
+        (assert (<= chromatic-number num-colors))
+        (define colors (color adjacency num-colors))
+        (for ([(vreg idx) label->idx])
+          (set-register! vreg (color->register (vector-ref colors idx))))]))
+
+   (for ([(cls spec) (in-dict available-regs)])
+     (cond
+       [(false? spec)
+        (define graph (hash-ref interference-graphs cls))
+        (assign-registers graph (iference-graph-chromatic-number graph)
+                          (lambda (i) (virtual-reg cls i)))]
+       [(= 1 (length spec))
+        (for ([reg (unit-vregs u)]
+              #:when (eq? (storage-class reg) cls))
+          (set-register! reg (car spec)))]
+       [else
+        (assign-registers (hash-ref interference-graphs cls)
+                          (length spec)
+                          (lambda (i) (list-ref spec i)))]))
+
+   register-ed))
+
+
+
+(define (regalloc u available-regs
+                  [preds-ed (predecessors u)]
+                  [live-ed (liveness u preds-ed)]
+                  [storage-classes-ed (storage-classes u)])
+  ;; update our storage class knowledge
+  (storage-classes u storage-classes-ed)
+  (let loop ([live-ed live-ed])
+    (define (spill-and-retry choices)
+      (printf "Spilling and retrying register allocation:\n")
+      (for ([spill choices])
+        (printf "  - ~a\n" (vreg-display spill)))
+      (spill u choices storage-classes-ed)
+      (storage-classes u storage-classes-ed)
+      (define live-ed* (liveness u preds-ed))
+      (show-unit u live-ed* storage-classes-ed)
+      (loop live-ed*))
+    (match (try-regalloc u
+                         available-regs
+                         preds-ed
+                         live-ed
+                         storage-classes-ed)
+      [(alloc-failure block instr cls regs num-to-spill)
+       (assert (not (eq? cls 'sf)))
+       ;; we can't spill any register that's def'd by the given instruction (that would be bad)
+       (define eligible-regs (filter-not (lambda (r) (and instr (memq r (instr-dsts (vinstr-op instr)))))
+                                         (set->list regs)))
+       (printf "Failed to allocate in B~a at instr ~a (live set ~a)\n"
+               (block-id block)
+               (vinstr-id instr)
+               (map vreg-display (set->list regs)))
+       ;; we also don't have anything intelligent to do right now, so just spill some arbitrary set
+       ;; of eligible registers to bring us down to the requred threshold
+       (spill-and-retry
+        (take eligible-regs num-to-spill))]
+      [register-assignments register-assignments])))
+
+
+
 
 
 
 
 (define (show-unit u . extra-datas)
+  (printf "-------------------------------------------\n")
   (define vreg-extra-data (filter (lambda (ed) (eq? 'vreg (extra-data-kind ed))) extra-datas))
   (define instr-extra-data (filter (lambda (ed) (eq? 'instr (extra-data-kind ed))) extra-datas))
   (define block-extra-data (filter (lambda (ed) (eq? 'block (extra-data-kind ed))) extra-datas))
@@ -454,7 +698,6 @@
          (define b (block! u label-expr))
          (instr! u b instr) ...)]))
 
-
 (module+ test
   (begin
     (define u (empty-unit))
@@ -472,9 +715,9 @@
      (phijmp loop-header (list n0 u0 v0)))
 
     (define b1 (block! u loop-header))
-    (instr! u b1 (phi n1 0 (list n0 n2)))
-    (instr! u b1 (phi u1 1 (list u0 v1)))
-    (instr! u b1 (phi v1 2 (list v0 next)))
+    (instr! u b1 (phi n1 0))
+    (instr! u b1 (phi u1 1))
+    (instr! u b1 (phi v1 2))
     (instr! u b1 (i64 x0 0))
     (instr! u b1 (cmp n1 x0 sf0))
     (instr! u b1 (jcc sf0 'Z done))
@@ -493,14 +736,19 @@
     #;(for ([block (stream-take (blocks-postorder u) 10)])
       (displayln (block-id block)))
 
-    (for ([block (blocks-reverse-postorder u)])
+    #;(for ([block (blocks-reverse-postorder u)])
       (displayln (block-id block)))
+
 
     (define live-in (liveness u))
     (define st-classes (storage-classes u))
-    (define allocs (regalloc u '(rax rbx rcx rdx rsi rdx r8 r9 r10)))
+    #;(spill u (list (spill-spec n1 b1)) st-classes)
+    #;(storage-classes u st-classes)
 
-    (show-unit u st-classes live-in allocs)
+    (define allocs (regalloc u '((sf . (sf))
+                                 (gp . (one two))
+                                 (spill . #f))))
+    (show-unit u st-classes allocs)
     ))
 
 
