@@ -208,6 +208,15 @@
   (set-block-instrs! block instrs)
   new-instr)
 
+(define (block-append-instr! u block instr)
+  (define new-instr (instr-raw! u instr))
+  (define instrs (append (block-instrs block) (list new-instr)))
+  (set-block-instrs! block instrs)
+  new-instr)
+
+(define (block-delete-instr! block instr)
+  (set-block-instrs! block (filter-not (lambda (i) (eq? i instr)) (block-instrs block))))
+
 (define (block-instr-idx block instr)
   (index-where
    (block-instrs block)
@@ -636,6 +645,54 @@
         (take eligible-regs num-to-spill))]
       [register-assignments register-assignments])))
 
+(define (phi-registers u)
+  (define phi-regs-ed (make-extra-block-data u))
+  (define-values (phi-regs set-phi-regs!) (use-extra-data phi-regs-ed))
+
+  (for ([label (unit-labels u)])
+    (define block (label-block label))
+    (set-phi-regs! block (make-vector (label-arity label) #f)))
+
+  (for ([block (unit-blocks u)])
+    (for ([instr (block-instrs block)])
+      (match (vinstr-op instr)
+        [(phi dst idx)
+         (assert (< idx (vector-length (phi-regs block))))
+         (vector-set! (phi-regs block) idx dst)]
+        [_ #f])))
+
+  phi-regs-ed)
+
+(define (unphi u
+               registers-ed
+               phi-regs-ed)
+  (define-values (register set-register!) (use-extra-data registers-ed))
+  (define-values (phi-regs set-phi-regs!) (use-extra-data phi-regs-ed))
+  (for ([block (unit-blocks u)])
+    ;; delete all the leading phis
+    (for ([instr (block-instrs block)])
+      #:break (not (phi? (vinstr-op instr)))
+      (block-delete-instr! block instr))
+
+    ;; delete the trailing phijmp
+    (unless (empty? (block-instrs block))
+      (for ([instr (block-instrs block)]
+            [idx (in-range (sub1 (length (block-instrs block))))])
+        (assert (not (phijmp? (vinstr-op instr))))))
+    (define last-i (last (block-instrs block)))
+    (match (vinstr-op last-i)
+      [(phijmp label srcs)
+       (define regs (phi-regs (label-block label)))
+       (assert (= (vector-length regs) (length srcs)))
+       (block-delete-instr! block last-i)
+       (for ([src srcs]
+             [dst regs])
+         (unless (eq? src dst)
+           (block-append-instr! u block (copy src dst))))
+       (block-append-instr! u block (jmp label))]
+      [_ #f])))
+
+
 
 
 
@@ -758,6 +815,8 @@
     (define allocs (regalloc u '((sf . (sf))
                                  (gp . (one two))
                                  (spill . #f))))
+    (show-unit u allocs)
+    (unphi u allocs (phi-registers u))
     (show-unit u allocs)
     ))
 
