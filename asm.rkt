@@ -614,7 +614,17 @@
       [(alloc-failure block instr cls regs num-to-spill)
        (assert (not (eq? cls 'sf)))
        ;; we can't spill any register that's def'd by the given instruction (that would be bad)
-       (define eligible-regs (filter-not (lambda (r) (and instr (memq r (instr-dsts (vinstr-op instr)))))
+       ;; or any register that's immediately src'd by the following instruction
+       ;; (that would be counterproductive [unless that instruction allows the src to be spill]
+       (define idx (block-instr-idx block instr))
+       (define succ (and (< (add1 idx) (length (block-instrs block)))
+                         (let ([i (list-ref (block-instrs block) (add1 idx))])
+                           (and (not (phijmp? (vinstr-op i)))
+                                (not (copy? (vinstr-op i)))
+                                i))))
+       (define eligible-regs (filter-not (lambda (r)
+                                           (or (and succ (memq r (instr-srcs (vinstr-op succ))))
+                                               (and instr (memq r (instr-dsts (vinstr-op instr))))))
                                          (set->list regs)))
        (printf "Failed to allocate in B~a at instr ~a (live set ~a)\n"
                (block-id block)
@@ -743,12 +753,12 @@
     (define live-in (liveness u))
     (define st-classes (storage-classes u))
     #;(spill u (list (spill-spec n1 b1)) st-classes)
-    #;(storage-classes u st-classes)
-
+    (storage-classes u st-classes)
+    (show-unit u st-classes)
     (define allocs (regalloc u '((sf . (sf))
                                  (gp . (one two))
                                  (spill . #f))))
-    (show-unit u st-classes allocs)
+    (show-unit u allocs)
     ))
 
 
