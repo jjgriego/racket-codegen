@@ -30,9 +30,9 @@
 
 (define-syntax (define-instruction stx)
   (syntax-parse stx
-    #:datum-literals (src imm dst target)
+    #:datum-literals (src imm mem dst target)
     [(_ (name:id
-         (~and (~or src imm dst target)
+         (~and (~or src imm mem dst target)
                type) ...))
 
      (define fields (syntax->datum #'(type ...)))
@@ -48,7 +48,8 @@
                   #:when (eq? type which))
          acc))
 
-     (with-syntax ([(field-name ...) field-names]
+     (with-syntax ([instr-info (format-id #'name "instr:~a" #'name)]
+                   [(field-name ...) field-names]
                    [(accessor ...) field-accessors]
                    [(setter ...) field-setters]
                    [(src-accessor ...) (filter-accessors 'src)]
@@ -56,7 +57,9 @@
                    [(imm-accessor ...) (filter-accessors 'imm)]
                    [(mem-accessor ...) (filter-accessors 'mem)]
                    [(target-accessor ...) (filter-accessors 'target)])
-       #'(struct name (field-name ...) #:mutable #:transparent
+       #'(begin
+           (define-syntax instr-info '(type ...))
+           (struct name (field-name ...) #:mutable #:transparent
            #:methods gen:instr
            [(define (instr-mneumonic i) 'name)
             (define (instr-operands i) (list (accessor i) ...))
@@ -68,19 +71,21 @@
             (define (instr-mems i) (list (mem-accessor i) ...))
             (define (instr-visit-operands i f)
               (f 'type (accessor i) (lambda (x) (setter i x))) ...)
-            (define (instr-targets i) (list (target-accessor i) ...))]))]))
+            (define (instr-targets i) (list (target-accessor i) ...))])))]))
+
+(define-syntax (instr-spec stx)
+  (syntax-case stx ()
+    [(_ name)
+     (let ([spec (syntax-local-value (format-id #'name "instr:~a" #'name))])
+       #`(quote #,(datum->syntax #f spec)))]))
 
 (define-instruction (conjure dst))
-(define-instruction (i64 dst imm))
-(define-instruction (add src src dst))
-(define-instruction (cmp src src dst))
-(define-instruction (jcc src imm target))
-(define-instruction (jmp target))
 (define-instruction (copy src dst))
-(define-instruction (ret src))
 (define-instruction (phi dst imm))
+(define-instruction (jmp target))
 
 ;; ssa-specific nonsense
+(define-syntax instr:phijmp '(target (listof src)))
 (struct phijmp (target srcs) #:mutable #:transparent
   #:methods gen:instr
   [(define (instr-mneumonic _) 'phijmp)
@@ -210,6 +215,34 @@
   (set-block-instrs! block (append instrs (list new-instr)))
   new-instr)
 
+;; ----------------------------------------------------------------------
+
+(define-syntax (asm-unit stx)
+  (syntax-parse stx
+    #:datum-literals (entry)
+    #:literals (phi)
+    [(_ (vreg-name ...)
+        (entry entry-instr ...)
+        (label-name (phi phi-dst:id phi-idx:number) ...
+                    block-instr ...) ...)
+     (with-syntax ([(arity ...) (map length (syntax->datum #'((phi-idx ...) ...)))])
+     #'(let ([u (empty-unit)])
+         (define vreg-name (vreg! u (~a 'vreg-name))) ...
+         (define label-name (label! u arity)) ...
+
+         (define entry-block (block! u (unit-entry u)))
+         (instr! u entry-block entry-instr)
+         ...
+
+          (let ([block-id (block! u label-name)])
+            (instr! u block-id (phi phi-dst phi-idx)) ...
+            (instr! u block-id block-instr) ...)
+          ...
+
+         u))]))
+
+;; ----------------------------------------------------------------------
+
 (define (block-insert-instr! u block instr [i 0])
   (define-values (before after) (split-at (block-instrs block) i))
   (define new-instr (instr-raw! u instr))
@@ -230,6 +263,12 @@
   (index-where
    (block-instrs block)
    (lambda (i) (eq? i instr))))
+
+(define (unit-map-instrs! u fn)
+  (for* ([b (unit-blocks u)]
+         [i (block-instrs b)])
+    (define op* (fn (vinstr-op i)))
+    (set-vinstr-op! i op*)))
 
 (define (find-def u reg)
   (for/or ([block (unit-blocks u)])
@@ -303,10 +342,6 @@
 ;; instr-liveness : Vinstr -> Seteq Vreg -> Extra-Data Block (Maybe (Seteq Vreg))
 (define (instr-liveness instr live-out block-live-in)
   (match (vinstr-op instr)
-    [(ret reg)
-     ;; if we're returning from this block (which must be the last instruction)
-     ;; then only the result register is live
-     (seteq reg)]
     [(phi dst idx)
      ;; phis only mark their dest as dead beforehand--the phijmp is the src that
      ;; will mark the input register(s) as live beforehand
@@ -344,23 +379,26 @@
 ;;      \|/
 ;;       #f
 ;;
-(define (storage-classes u [storage-class-ed (make-extra-vreg-data u 'top)])
-  (define-values (storage-class set-storage-class!) (use-extra-data storage-class-ed))
 
-  (define (intersect-storage-class s1 s2)
-    (match* (s1 s2)
-      [('top x) x]
-      [(x 'top) x]
-      [(#f x) #f]
-      [(x #f) #f]
-      [('sf 'sf) 'sf]
-      [('sf x) #f]
-      [(x 'sf) #f]
-      [('word x) x]
-      [(x 'word) x]
-      [('gp    'gp)    'gp]
-      [('spill 'spill) 'spill]
-      [(_ _) #f]))
+(define (intersect-storage-class s1 s2)
+  (match* (s1 s2)
+    [('top x) x]
+    [(x 'top) x]
+    [(#f x) #f]
+    [(x #f) #f]
+    [('sf 'sf) 'sf]
+    [('sf x) #f]
+    [(x 'sf) #f]
+    [('word x) x]
+    [(x 'word) x]
+    [('gp    'gp)    'gp]
+    [('spill 'spill) 'spill]
+    [(_ _) #f]))
+
+(define (storage-classes u
+                         instr-storage-classes
+                         [storage-class-ed (make-extra-vreg-data u 'top)])
+  (define-values (storage-class set-storage-class!) (use-extra-data storage-class-ed))
 
   (define (refine! v sc)
     (define sc* (intersect-storage-class (storage-class v) sc))
@@ -369,33 +407,8 @@
 
   (for ([block (unit-blocks u)])
     (for ([instr (block-instrs block)])
-      (match (vinstr-op instr)
-        ;; jcc and cmp operate on the sf register only
-        [(jcc src _ _)
-         (refine! src 'sf)]
-        [(cmp s0 s1 dst)
-         (refine! s0 'gp)
-         (refine! s1 'gp)
-         (refine! dst 'sf)]
-        ;; copy is the special snowflake that can move between
-        ;; gp and spill space
-        [(copy src dst)
-         (refine! src 'word)
-         (refine! dst 'word)]
-        ;; phis are really copies we'd like to be able to optimize away--in
-        ;; particular it's possible for a spilled vreg to be the dst or a
-        ;; src of a phi
-        [(phi dst _)
-         (refine! dst 'word)]
-        ;; phijmps permit spills also for the same reason
-        [(phijmp _ srcs)
-         (for ([src srcs]) (refine! src 'word))]
-        ;; unless otherwise specified, instructions operate on gps
-        [ins
-         (for ([src (instr-srcs ins)])
-           (refine! src 'gp))
-         (for ([src (instr-dsts ins)])
-           (refine! src 'gp))])))
+      (instr-storage-classes (vinstr-op instr) refine!)))
+
   storage-class-ed)
 
 ;; visit all the blocks reachable from this one
@@ -516,10 +529,10 @@
 
 (define (try-regalloc u
                       available-regs
+                      storage-class-ed
                       [phi-regs-ed (phi-registers u)]
                       [preds-ed (predecessors u)]
-                      [live-ed (liveness u preds-ed)]
-                      [storage-class-ed (storage-classes u)])
+                      [live-ed (liveness u preds-ed)])
   (define-values (storage-class set-storage-class!) (use-extra-data storage-class-ed))
   (define-values (phi-registers set-phi-registers!) (use-extra-data phi-regs-ed))
 
@@ -654,28 +667,31 @@
 
 
 
-(define (regalloc u available-regs
+(define (regalloc u
+                  available-regs
+                  instr-storage-classes
                   [preds-ed (predecessors u)]
                   [live-ed (liveness u preds-ed)]
-                  [storage-classes-ed (storage-classes u)])
+                  [storage-classes-ed
+                   (storage-classes u instr-storage-classes)])
   ;; update our storage class knowledge
-  (storage-classes u storage-classes-ed)
+  (storage-classes u instr-storage-classes storage-classes-ed)
   (let loop ([live-ed live-ed])
     (define (spill-and-retry choices)
       (printf "Spilling and retrying register allocation:\n")
       (for ([spill choices])
         (printf "  - ~a\n" (vreg-display spill)))
       (spill u choices storage-classes-ed)
-      (storage-classes u storage-classes-ed)
+      (storage-classes u instr-storage-classes storage-classes-ed)
       (define live-ed* (liveness u preds-ed))
       (show-unit u live-ed* storage-classes-ed)
       (loop live-ed*))
     (match (try-regalloc u
                          available-regs
+                         storage-classes-ed
                          (phi-registers u)
                          preds-ed
-                         live-ed
-                         storage-classes-ed)
+                         live-ed)
       [(alloc-failure block instr cls regs num-to-spill)
        (assert (not (eq? cls 'sf)))
        ;; we can't spill any register that's def'd by the given instruction (that would be bad)
@@ -827,6 +843,15 @@
     (when (trivial? instr)
       (block-delete-instr! block instr))))
 
+(define (collapse-phys-regs u registers-ed physregs)
+  (define-values (register set-register!) (use-extra-data registers-ed))
+  (define mappings (for/list ([v (unit-vregs u)]
+                             #:when (symbol? (register v)))
+                    (cons v (dict-ref physregs (register v)))))
+  (for* ([block (unit-blocks u)]
+         [instr (block-instrs block)]
+         [mapping mappings])
+    (instr-rename-vreg! (vinstr-op instr) (car mapping) (cdr mapping))))
 
 
 
@@ -900,8 +925,14 @@
          (define b (block! u label-expr))
          (instr! u b instr) ...)]))
 
-(module+ test
+#;(module+ test
   (begin
+    (define-instruction (i64 dst imm))
+    (define-instruction (add src src dst))
+    (define-instruction (cmp src src dst))
+    (define-instruction (jcc src imm target))
+    (define-instruction (ret src))
+
     (define u (empty-unit))
     (define loop-header (label! u 3))
     (define loop-body (label! u))
