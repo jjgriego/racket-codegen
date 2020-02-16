@@ -8,6 +8,8 @@
           syntax/parse]
          "graph-color.rkt")
 
+(provide (all-defined-out))
+
 (define-generics instr
   (instr-mneumonic instr)
   (instr-operands instr)
@@ -16,6 +18,9 @@
   (instr-imms instr)
   (instr-targets instr)
   (instr-visit-operands instr f))
+
+(define-generics mem
+  (mem-srcs mem))
 
 (define-syntax (assert stx)
   (syntax-case stx ()
@@ -49,14 +54,18 @@
                    [(src-accessor ...) (filter-accessors 'src)]
                    [(dst-accessor ...) (filter-accessors 'dst)]
                    [(imm-accessor ...) (filter-accessors 'imm)]
+                   [(mem-accessor ...) (filter-accessors 'mem)]
                    [(target-accessor ...) (filter-accessors 'target)])
        #'(struct name (field-name ...) #:mutable #:transparent
            #:methods gen:instr
            [(define (instr-mneumonic i) 'name)
             (define (instr-operands i) (list (accessor i) ...))
-            (define (instr-srcs i) (list (src-accessor i) ...))
+            (define (instr-srcs i) (list* (src-accessor i) ...
+                                          (append (mem-srcs (mem-accessor i))
+                                                  ...)))
             (define (instr-dsts i) (list (dst-accessor i) ...))
             (define (instr-imms i) (list (imm-accessor i) ...))
+            (define (instr-mems i) (list (mem-accessor i) ...))
             (define (instr-visit-operands i f)
               (f 'type (accessor i) (lambda (x) (setter i x))) ...)
             (define (instr-targets i) (list (target-accessor i) ...))]))]))
@@ -910,7 +919,7 @@
     (storage-classes u st-classes)
     (show-unit u st-classes)
     (define available-regs '((sf . (sf))
-                             (gp . (rax rbx rcx))
+                             (gp . (rax rbx rcx rdx rsi rdi r8 r9 r10))
                              (spill . #f)))
     (define allocs (regalloc u available-regs))
     (show-unit u allocs)
