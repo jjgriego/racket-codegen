@@ -3,7 +3,7 @@
 (require "asm.rkt")
 
 (define default-register-spec
-  '((gp . (rax rbx rcx rdx rsi rdi r8 r9 r10 r11 r12 r13 r14 r15))
+  '((gp . (rax rcx rdx r8 r9 r10 r11 r12 r13 r14 r15 rsi rdi))
     (sf . (sf))
     (spill . #f)))
 
@@ -11,7 +11,7 @@
   (syntax-case stx ()
     [(_ set-name (name ...))
      #'(begin
-         (define name (vreg #f (~a 'name)))
+         (define name (vreg #f (~a 'name) #t))
          ...
          (define set-name `((name . ,name) ...)))]))
 
@@ -30,13 +30,43 @@
   (mem (* 8 n) rbp 0 1))
 
 (define-instruction (movi imm dst))
-(define-instruction (add src src dst))
+(define-instruction (add* src src dst))
+(define-instruction (sub* src src dst))
 (define-instruction (mov src dst))
 (define-instruction (store src mem))
 (define-instruction (load mem dst))
 (define-instruction (jcc src imm target))
 (define-instruction (cmp src src dst))
-(define-instruction (ret src))
+(define-instruction (ret* src))
+(define-instruction (ret))
+(define-instruction (push src))
+(define-instruction (pop dst))
+
+(define-instruction (sub dst src))
+(define-instruction (subi dst imm))
+(define-instruction (add dst src))
+(define-instruction (addi dst imm))
+
+;; pseudo-instructions
+(define-syntax instr:enter-frame '((listof dst)))
+(struct enter-frame (dsts) #:mutable #:transparent
+  #:methods gen:instr
+  [(define (instr-mneumonic _) 'enter-frame)
+   (define (instr-operands i) (enter-frame-dsts i))
+   (define (instr-srcs i) '())
+   (define (instr-dsts i) (enter-frame-dsts i))
+   (define (instr-imms i) '())
+   (define (instr-targets i) '())
+   (define (instr-visit-operands i f)
+     (define ((update-dsts-at! idx) x)
+       (set-enter-frame-dsts! i (list-set (enter-frame-dsts i) idx x)))
+     (for ([dst (enter-frame-dsts i)]
+           [i (in-naturals)])
+       (f 'dst dst (update-dsts-at! i))))])
+
+(define-instruction (leave-frame))
+
+
 
 (define (instr-storage-classes op visit)
   (match op
@@ -67,52 +97,170 @@
      (for ([src (instr-dsts ins)])
        (visit src 'gp))]))
 
-(define (lower-copies u)
+(define (count-spill-slots u registers-ed)
+  (define-values (register set-register!) (use-extra-data registers-ed))
+  (define access-idxs (map virtual-reg-idx
+                           (filter (lambda (alloc)
+                                     (and (virtual-reg? alloc)
+                                          (eq? (virtual-reg-cls alloc) 'spill)))
+                                   (map register (unit-vregs u)))))
+  (if (empty? access-idxs)
+      0
+      (add1 (max access-idxs))))
+
+(define (frame-register-constraints u)
+  (for*/first ([b (unit-blocks u)]
+               [i (block-instrs b)]
+               #:when (enter-frame? (vinstr-op i)))
+    (match (vinstr-op i)
+      [(enter-frame dsts)
+       (for/list ([r dsts]
+                  [pr '(rdi rsi rdx rcx r8 r9)])
+         (cons r pr))])))
+
+
+(define (lower-frame u registers)
+  (define spill-slots (count-spill-slots u registers))
+
+  (unit-replace-instrs! u (lambda (op replace!)
+                            (match op
+                              [(enter-frame dsts)
+                               (replace! (list
+                                          (push rbp)
+                                          (mov rsp rbp)
+                                          (subi rsp (* 8 spill-slots))
+                                          ))]
+                              [(leave-frame)
+                               (replace! (list
+                                          (mov rbp rsp)
+                                          (pop rbp)))]
+                              [_ (void)]))))
+
+(define (lower-three-address u)
+  (unit-replace-instrs! u
+                        (lambda (op replace!)
+                          (match op
+                            [(add* s0 s1 dst)
+                             (replace! (list
+                                        (add s0 s1)
+                                        (mov s0 dst)))]
+                            [(sub* s0 s1 dst)
+                             (replace! (list
+                                        (add s0 s1)
+                                        (mov s0 dst)))]
+                            [_ (void)]))))
+
+(define (lower-return u)
+  (unit-replace-instrs! u (lambda (op replace!)
+                            (match op
+                              [(ret* src)
+                               (replace! (list (mov src rax)
+                                               (ret)))]
+                              [_ (void)]))))
+
+(define (trivial-mov u)
+  (unit-replace-instrs! u (lambda (op replace!)
+                            (match op
+                              [(mov r r) (replace! '())]
+                              [_ (void)]))))
+
+(define (lower-copies u registers-ed)
+  (define-values (register set-register!) (use-extra-data registers-ed))
   (unit-map-instrs! u
                     (lambda (op)
                       (match op
-                        [(copy (virtual-reg 'spill n) (virtual-reg 'spill m))
-                         ;; oops uh oh
-                         (assert #f)]
-                        [(copy (virtual-reg 'spill n) dst)
-                         (load (stack-access n) dst)]
-                        [(copy src (virtual-reg 'spill n))
-                         (store src (stack-access n))]
                         [(copy src dst)
-                         (mov src dst)]
+                         (match* ((register src) (register dst))
+                           [((virtual-reg 'spill n) (virtual-reg 'spill m))
+                            ;;; XXX this really shouldn't be allowed to happen
+                            ;;; but nothing prevents it rn
+                            (assert #f)]
+                           [((virtual-reg 'spill n) _)
+                            (load (stack-access n) dst)]
+                           [(_ (virtual-reg 'spill n))
+                            (store src (stack-access n))]
+                           [(_ _)
+                            (mov src dst)])]
                         [_ op]))))
+
+(define (write-unit-asm u)
+
+  ;; choose local label names
+  (define label-name-ed (make-extra-label-data u))
+  (define-values (label-name set-label-name!) (use-extra-data label-name-ed))
+  (for ([l (unit-labels u)])
+    (set-label-name! l (gensym '.L)))
+
+  (define (write-instr op)
+    (define (reg r)
+      (assert (vreg-physical? r))
+      (format "%~a" (vreg-display r)))
+    (define (target t)
+      (~a (label-name t)))
+    (define (imm i)
+      (format "$~a" i))
+    (match op
+      [(push src) (printf "push ~a" (reg src))]
+      [(pop dst) (printf "pop ~a" (reg dst))]
+      [(mov src dst) (printf "mov ~a, ~a" (reg src) (reg dst))]
+      [(add inout s1) (printf "add ~a, ~a" (reg s1) (reg inout))]
+      [(sub inout s1) (printf "sub ~a, ~a" (reg s1) (reg inout))]
+      [(subi inout i) (printf "sub ~a, ~a" (imm i) (reg inout))]
+      [(subi inout i) (printf "add ~a, ~a" (imm i) (reg inout))]
+      [(movi i dst) (printf "mov ~a, ~a" (imm i) (reg dst))]
+      [(cmp s0 s1 _) (printf "cmp ~a, ~a" (reg s0) (reg s1))]
+      [(jcc _ 'Z t) (printf "jz ~a" (target t))]
+      [(jmp t) (printf "jmp ~a" (target t))]
+      [(ret) (printf "ret")]))
+
+  (for ([l (unit-labels u)])
+    (printf "~a:\n" (label-name l))
+    (for ([i (block-instrs (label-block l))])
+      (display "  ")
+      (write-instr (vinstr-op i))
+      (display "\n"))))
 
 (module+ test
   (define u (asm-unit
              (n a b n0 a0 b0 t0 sf0 t1 n1 sum)
-             (entry (conjure n)
-                    (movi 1 a)
-                    (movi 1 b)
-                    (phijmp loop-header (list n a b)))
-             (loop-header (phi n0 0)
-                          (phi a0 1)
-                          (phi b0 2)
-                          (movi 0 t0)
-                          (cmp t0 n0 sf0)
-                          (jcc sf0 'Z done)
-                          (jmp loop-body))
-             (loop-body (movi -1 t1)
-                        (add n0 t1 n1)
-                        (add a0 b0 sum)
-                        (phijmp loop-header (list n1 b0 sum)))
-             (done (ret a0))))
+             (entry
+              (enter-frame (list n))
+              (movi 1 a)
+              (movi 1 b)
+              (phijmp loop-header (list n a b)))
+             (loop-header
+              (phi n0 0)
+              (phi a0 1)
+              (phi b0 2)
+              (movi 0 t0)
+              (cmp t0 n0 sf0)
+              (jcc sf0 'Z done)
+              (jmp loop-body))
+             (loop-body
+              (movi -1 t1)
+              (add* n0 t1 n1)
+              (add* a0 b0 sum)
+              (phijmp loop-header (list n1 b0 sum)))
+             (done
+              (leave-frame)
+              (ret* a0))))
   (show-unit u)
-  (define allocs (regalloc u default-register-spec instr-storage-classes))
+  (define must-colors (frame-register-constraints u))
+  (define allocs (regalloc u default-register-spec must-colors instr-storage-classes))
   (unphi u
          default-register-spec
          (liveness u)
          allocs
          (phi-registers u))
   (show-unit u allocs)
+  (lower-frame u allocs)
+  (lower-copies u allocs)
   (collapse-phys-regs u allocs x64-physregs)
-  (lower-copies u)
+  (lower-return u)
+  (lower-three-address u)
+  (trivial-mov u)
   (show-unit u)
-  )
+  (write-unit-asm u))
 
 
 

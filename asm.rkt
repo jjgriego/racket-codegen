@@ -70,6 +70,7 @@
             (define (instr-imms i) (list (imm-accessor i) ...))
             (define (instr-mems i) (list (mem-accessor i) ...))
             (define (instr-visit-operands i f)
+              (void)
               (f 'type (accessor i) (lambda (x) (setter i x))) ...)
             (define (instr-targets i) (list (target-accessor i) ...))])))]))
 
@@ -113,8 +114,8 @@
 (struct unit (labels blocks vregs instrs) #:transparent #:mutable)
 (struct block (id instrs) #:transparent #:mutable)
 (struct vinstr (id op) #:transparent #:mutable)
-(struct label (block arity) #:transparent #:mutable)
-(struct vreg (id display) #:transparent #:mutable)
+(struct label (id block arity) #:transparent #:mutable)
+(struct vreg (id display physical?) #:transparent #:mutable)
 
 
 ;; extra data
@@ -139,6 +140,13 @@
               vreg?
               vreg-id
               (build-list (length (unit-vregs u)) (lambda (_) (box default-value)))
+              default-value))
+
+(define (make-extra-label-data u [default-value #f])
+  (extra-data 'label
+              label?
+              label-id
+              (build-list (length (unit-labels u)) (lambda (_) (box default-value)))
               default-value))
 
 (define (extra-data-ref-raw xd x)
@@ -170,7 +178,7 @@
 
 ;; building units
 
-(define (empty-unit) (unit (list (label #f 0))
+(define (empty-unit) (unit (list (label 0 #f 0))
                            '() ; blocks
                            '() ; vregs 
                            '() ; instrs
@@ -193,13 +201,14 @@
   (define vregs (unit-vregs unit))
   (define new-vreg (vreg (length vregs)
                          (or display-name
-                             (format "x~a" (length vregs)))))
+                             (format "x~a" (length vregs)))
+                         #f))
   (set-unit-vregs! unit (append vregs (list new-vreg)))
   new-vreg)
 
 (define (label! unit [arity 0])
   (define labels (unit-labels unit))
-  (define new-label (label #f arity))
+  (define new-label (label (length labels) #f arity))
   (set-unit-labels! unit (append labels (list new-label)))
   new-label)
 
@@ -256,6 +265,16 @@
   (set-block-instrs! block instrs)
   new-instr)
 
+(define (block-replace-range! u block start end new-ops)
+  (displayln `(replace ,start ,end ,new-ops))
+  (define new-instrs (map (lambda (o)
+                            (instr-raw! u o))
+                          new-ops))
+  (define-values (before xs) (split-at (block-instrs block) start))
+  (define-values (inside after) (split-at xs (- end start)))
+  (set-block-instrs! block (append before new-instrs after))
+  new-instrs)
+
 (define (block-delete-instr! block instr)
   (set-block-instrs! block (filter-not (lambda (i) (eq? i instr)) (block-instrs block))))
 
@@ -264,11 +283,66 @@
    (block-instrs block)
    (lambda (i) (eq? i instr))))
 
+;; ----------------------------------------------------------------------
+
+(struct zipper (unit block idx) #:transparent #:mutable)
+
+(define (zipper-can-advance? z)
+  (match z
+    [(zipper u b idx)
+     (< (add1 idx) (length (block-instrs b)))]))
+
+(define (zipper-advance! z)
+  (match z
+    [(zipper u b idx)
+     (assert (zipper-can-advance? z))
+     (set-zipper-idx! z (add1 idx))]))
+
+(define (zipper-instr z)
+  (match z
+    [(zipper u b idx)
+     (list-ref (block-instrs b) idx)]))
+
+(define (zipper-set! z op)
+  (define vi (zipper-instr z))
+  (set-vinstr-op! vi op))
+
+(define (zipper-replace! z ops [len 1])
+  (match z
+    [(zipper u b idx)
+     (assert (<= (+ idx len) (length (block-instrs b))))
+     (block-replace-range! u b idx (+ idx len) ops)]))
+
+(define (zipper-insert-before! z op)
+  (match z
+    [(zipper u b idx)
+     (block-insert-instr! u b op idx)
+     (set-zipper-idx! z (add1 idx))]))
+
+(define (zipper-insert-after! z op)
+  (match z
+    [(zipper u b idx)
+     (block-insert-instr! u b op (add1 idx))]))
+
+;; ----------------------------------------------------------------------
+
 (define (unit-map-instrs! u fn)
   (for* ([b (unit-blocks u)]
          [i (block-instrs b)])
     (define op* (fn (vinstr-op i)))
     (set-vinstr-op! i op*)))
+
+(define (unit-replace-instrs! u fn)
+  (for ([b (unit-blocks u)])
+    (unless (empty? (block-instrs b))
+      (define z (zipper u b 0))
+      (let loop ()
+        (fn (vinstr-op (zipper-instr z))
+          (lambda (ops)
+            (zipper-replace! z ops)))
+        (when (zipper-can-advance? z)
+          (zipper-advance! z)
+          (loop))))))
 
 (define (find-def u reg)
   (for/or ([block (unit-blocks u)])
@@ -527,8 +601,18 @@
 
 (struct virtual-reg (cls idx) #:prefab)
 
+;; attempt to color the provided unit with the provided register spec,
+;; a dict mapping storage classes to a list of physreg names or false (if the class has unbounded size)
+;;
+;; required-colors is a dict from vreg to physreg names. The vregs involved must all
+;; interfere with each other--i.e. they are all live at at least one program point.
+;; this is so the allocator can achieve the required colors simply by permuting the colors in the unit
+;;
+;; The return value is either a vreg-extra-data w/ the register assignments or a
+;; alloc-failure struct describing the program point where register allocation failed
 (define (try-regalloc u
                       available-regs
+                      required-colors
                       storage-class-ed
                       [phi-regs-ed (phi-registers u)]
                       [preds-ed (predecessors u)]
@@ -583,7 +667,8 @@
 
   (define (visit-live regs block instr)
     (define (live-regs-with-class cls)
-      (filter (lambda (r) (eq? cls (storage-class r)))
+      (filter (lambda (r) (and (not (vreg-physical? r))
+                               (eq? cls (storage-class r))))
               (set->list regs)))
 
     (define (interference-set regs graph)
@@ -640,20 +725,26 @@
    (define register-ed (make-extra-vreg-data u))
    (define-values (register set-register!) (use-extra-data register-ed))
 
-   (define (assign-registers graph num-colors color->register)
+   (define (assign-registers graph num-colors coloring->registers)
      (match graph
        [(iference-graph label->idx adjacency prefs chromatic-number)
         (assert (<= chromatic-number num-colors))
         (define colors (color adjacency num-colors prefs))
+        (define regs (coloring->registers (for/list ([(vreg idx) label->idx])
+                                            (cons vreg (vector-ref colors idx)))))
         (for ([(vreg idx) label->idx])
-          (set-register! vreg (color->register (vector-ref colors idx))))]))
+          (set-register! vreg (vector-ref regs (vector-ref colors idx))))]))
 
    (for ([(cls spec) (in-dict available-regs)])
      (cond
        [(false? spec)
         (define graph (hash-ref interference-graphs cls))
         (assign-registers graph (iference-graph-chromatic-number graph)
-                          (lambda (i) (virtual-reg cls i)))]
+                          (lambda (coloring)
+                            (if (empty? coloring)
+                                (vector)
+                                (build-vector (max (map cdr coloring))
+                                             (lambda (i) (virtual-reg cls i))))))]
        [(= 1 (length spec))
         (for ([reg (unit-vregs u)]
               #:when (eq? (storage-class reg) cls))
@@ -661,7 +752,28 @@
        [else
         (assign-registers (hash-ref interference-graphs cls)
                           (length spec)
-                          (lambda (i) (list-ref spec i)))]))
+                          (lambda (coloring)
+                            ;; at this point we need to cook up a permutation of registers that
+                            ;; satisfies the constraints in required-colors
+                            (define reg-permutation (make-vector (length spec) #f))
+                            (define remaining-regs (list->mutable-seteq spec))
+                            (for ([c required-colors])
+                              (define vreg (car c))
+                              (define forced-reg (cdr c))
+                              (define color (cdr (assq (car c) coloring)))
+                              (assert (false? (vector-ref reg-permutation color)))
+                              (assert (set-member? remaining-regs forced-reg))
+                              (vector-set!  reg-permutation color forced-reg)
+                              (set-remove! remaining-regs forced-reg))
+                            (for/fold ([spec (filter (lambda (pr) (set-member? remaining-regs pr))
+                                                     spec)])
+                                      ([i (in-range (length spec))])
+                              (cond
+                                [(false? (vector-ref reg-permutation i))
+                                 (vector-set! reg-permutation i (car spec))
+                                 (cdr spec)]
+                                [else spec]))
+                            reg-permutation))]))
 
    register-ed))
 
@@ -669,6 +781,7 @@
 
 (define (regalloc u
                   available-regs
+                  required-colors
                   instr-storage-classes
                   [preds-ed (predecessors u)]
                   [live-ed (liveness u preds-ed)]
@@ -688,6 +801,7 @@
       (loop live-ed*))
     (match (try-regalloc u
                          available-regs
+                         required-colors
                          storage-classes-ed
                          (phi-registers u)
                          preds-ed
