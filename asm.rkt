@@ -337,7 +337,7 @@
     (unless (empty? (block-instrs b))
       (define z (zipper u b 0))
       (let loop ()
-        (fn (vinstr-op (zipper-instr z))
+        (fn (zipper-instr z)
           (lambda (ops)
             (zipper-replace! z ops)))
         (when (zipper-can-advance? z)
@@ -413,8 +413,8 @@
       (loop (add1 iters))))
   result)
 
-;; instr-liveness : Vinstr -> Seteq Vreg -> Extra-Data Block (Maybe (Seteq Vreg))
-(define (instr-liveness instr live-out block-live-in)
+;; instr-live-in : Vinstr -> Seteq Vreg -> Extra-Data Block (Maybe (Seteq Vreg))
+(define (instr-live-in instr live-out block-live-in)
   (match (vinstr-op instr)
     [(phi dst idx)
      ;; phis only mark their dest as dead beforehand--the phijmp is the src that
@@ -432,14 +432,29 @@
                    ;; kill any regs used as a dst
                    (list->seteq (instr-dsts (vinstr-op instr))))]))
 
-
 (define (liveness unit [preds-ed (predecessors unit)])
   (define preds (use-extra-data-ref preds-ed))
   (blocks-fixpoint unit preds #f
                    (lambda (block block-live-regs)
                      (for/fold ([live (seteq)])
                                ([instr (reverse (block-instrs block))])
-                       (instr-liveness instr live block-live-regs)))))
+                       (instr-live-in instr live block-live-regs)))))
+
+(define (instr-liveness unit
+                        [preds-ed (predecessors unit)]
+                        [block-liveness-ed (liveness unit preds-ed)])
+  (define-values (block-live-in set-block-live-in!) (use-extra-data block-liveness-ed))
+  (define instr-liveness-ed (make-extra-instr-data unit))
+  (define-values (instr-live-out set-instr-live-out!) (use-extra-data instr-liveness-ed))
+
+  (for ([b (unit-blocks unit)])
+    (for/fold ([live (seteq)])
+              ([i (reverse (block-instrs b))])
+      (set-instr-live-out! i live)
+      (instr-live-in i live block-live-in)))
+
+  instr-liveness-ed)
+
 
 ;; vregs have one of the following storage classes, which form a lattice as
 ;; follows
@@ -703,7 +718,7 @@
      (define block-live-in
        (for/fold ([live-out (seteq)])
                  ([instr (reverse (block-instrs block))])
-         (define live-in (instr-liveness instr live-out block-live-regs))
+         (define live-in (instr-live-in instr live-out block-live-regs))
 
          (match (vinstr-op instr)
            [(phijmp target srcs)

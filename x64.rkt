@@ -3,7 +3,7 @@
 (require "asm.rkt")
 
 (define default-register-spec
-  '((gp . (rax rcx rdx r8 r9 r10 r11 r12 r13 r14 r15 rsi rdi))
+  '((gp . (rax rcx rdx r8 r9 r10 r11 rsi rdi))
     (sf . (sf))
     (spill . #f)))
 
@@ -27,7 +27,7 @@
                             (mem-index))))])
 
 (define (stack-access n)
-  (mem (* 8 n) rbp 0 1))
+  (mem (* -8 (add1 n)) rbp #f #f))
 
 (define-instruction (movi imm dst))
 (define-instruction (add* src src dst))
@@ -37,6 +37,7 @@
 (define-instruction (load mem dst))
 (define-instruction (jcc src imm target))
 (define-instruction (cmp src src dst))
+(define-instruction (call* imm src dst))
 (define-instruction (ret* src))
 (define-instruction (ret))
 (define-instruction (push src))
@@ -46,6 +47,7 @@
 (define-instruction (subi dst imm))
 (define-instruction (add dst src))
 (define-instruction (addi dst imm))
+(define-instruction (call imm))
 
 ;; pseudo-instructions
 (define-syntax instr:enter-frame '((listof dst)))
@@ -106,7 +108,7 @@
                                    (map register (unit-vregs u)))))
   (if (empty? access-idxs)
       0
-      (add1 (max access-idxs))))
+      (add1 (apply max access-idxs))))
 
 (define (frame-register-constraints u)
   (for*/first ([b (unit-blocks u)]
@@ -123,7 +125,7 @@
   (define spill-slots (count-spill-slots u registers))
 
   (unit-replace-instrs! u (lambda (op replace!)
-                            (match op
+                            (match (vinstr-op op)
                               [(enter-frame dsts)
                                (replace! (list
                                           (push rbp)
@@ -136,10 +138,66 @@
                                           (pop rbp)))]
                               [_ (void)]))))
 
+(define (lower-call* u registers-ed)
+  (define-values (register set-register!) (use-extra-data registers-ed))
+  (define-values (instr-live-out set-instr-live-out!) (use-extra-data (instr-liveness u)))
+
+  (define (find-spills live-allocs needed)
+    (define occupied (list->set (filter-map (lambda (a)
+                                              (and (virtual-reg? a)
+                                                   (eq? (virtual-reg-cls a) 'spill)
+                                                   (virtual-reg-idx a)))
+                                            live-allocs)))
+    (let loop ([idx 0]
+               [needed needed]
+               [selected '()])
+      (cond
+        [(= 0 needed)
+         selected]
+        [(set-member? occupied idx)
+         (loop (add1 idx) needed selected)]
+        [else
+         (loop (add1 idx) (sub1 needed) (cons (virtual-reg 'spill idx) selected))])))
+
+  (unit-replace-instrs! u
+                        (lambda (i replace!)
+                          (match (vinstr-op i)
+                            [(call* f src dst)
+                             (define live-out (instr-live-out i))
+                             (define caller-save '(rax rcx rdx r8 r9 r10 r11))
+                             (define live-allocs
+                               (map register (set->list live-out)))
+                             (define spilled
+                               (filter (lambda (r)
+                                         (memq (register r) caller-save))
+                                       (set->list live-out)))
+                             (define slots (map (lambda (a)
+                                                  (define r (vreg! u))
+                                                  (set-register! r a)
+                                                  r)
+                                                (find-spills live-allocs (length spilled))))
+
+                             (define saves (map (lambda (r slot)
+                                                  (copy r slot))
+                                                spilled
+                                                slots))
+                             (define restores (map (lambda (r slot)
+                                                     (copy slot r))
+                                                   spilled
+                                                   slots))
+
+                             (replace! `(,@saves
+                                         ,(mov src rdi)
+                                         ,(call f)
+                                         ,(mov rax dst)
+                                         ,@restores))
+                             ]
+                            [_ (void)]))))
+
 (define (lower-three-address u)
   (unit-replace-instrs! u
                         (lambda (op replace!)
-                          (match op
+                          (match (vinstr-op op)
                             [(add* s0 s1 dst)
                              (replace! (list
                                         (add s0 s1)
@@ -152,7 +210,7 @@
 
 (define (lower-return u)
   (unit-replace-instrs! u (lambda (op replace!)
-                            (match op
+                            (match (vinstr-op op)
                               [(ret* src)
                                (replace! (list (mov src rax)
                                                (ret)))]
@@ -160,7 +218,7 @@
 
 (define (trivial-mov u)
   (unit-replace-instrs! u (lambda (op replace!)
-                            (match op
+                            (match (vinstr-op op)
                               [(mov r r) (replace! '())]
                               [_ (void)]))))
 
@@ -199,6 +257,12 @@
       (~a (label-name t)))
     (define (imm i)
       (format "$~a" i))
+    (define (memory m)
+      (match m
+        [(mem base #f #f #f)
+         (format "~a" base)]
+        [(mem base offset #f #f)
+         (format "~a(~a)" base (reg offset))]))
     (match op
       [(push src) (printf "push ~a" (reg src))]
       [(pop dst) (printf "pop ~a" (reg dst))]
@@ -209,6 +273,9 @@
       [(subi inout i) (printf "add ~a, ~a" (imm i) (reg inout))]
       [(movi i dst) (printf "mov ~a, ~a" (imm i) (reg dst))]
       [(cmp s0 s1 _) (printf "cmp ~a, ~a" (reg s0) (reg s1))]
+      [(store src dst) (printf "mov ~a, ~a" (reg src) (memory dst))]
+      [(load src dst) (printf "mov ~a, ~a" (memory src) (reg dst))]
+      [(call t) (printf "call ~a" t)]
       [(jcc _ 'Z t) (printf "jz ~a" (target t))]
       [(jmp t) (printf "jmp ~a" (target t))]
       [(ret) (printf "ret")]))
@@ -222,7 +289,7 @@
 
 (module+ test
   (define u (asm-unit
-             (n a b n0 a0 b0 t0 sf0 t1 n1 sum)
+             (n a b n0 a0 b0 t0 sf0 t1 n1 sum trash)
              (entry
               (enter-frame (list n))
               (movi 1 a)
@@ -242,6 +309,7 @@
               (add* a0 b0 sum)
               (phijmp loop-header (list n1 b0 sum)))
              (done
+              (call* 'print a0 trash)
               (leave-frame)
               (ret* a0))))
   (show-unit u)
@@ -253,6 +321,7 @@
          allocs
          (phi-registers u))
   (show-unit u allocs)
+  (lower-call* u allocs)
   (lower-frame u allocs)
   (lower-copies u allocs)
   (collapse-phys-regs u allocs x64-physregs)
