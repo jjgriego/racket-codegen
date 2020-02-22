@@ -20,7 +20,8 @@
   (instr-visit-operands instr f))
 
 (define-generics mem
-  (mem-srcs mem))
+  (mem-srcs mem)
+  (mem-visit-operands mem f))
 
 (define-syntax (assert stx)
   (syntax-case stx ()
@@ -80,6 +81,7 @@
      (let ([spec (syntax-local-value (format-id #'name "instr:~a" #'name))])
        #`(quote #,(datum->syntax #f spec)))]))
 
+(define-instruction (nop))
 (define-instruction (conjure dst))
 (define-instruction (copy src dst))
 (define-instruction (phi dst imm))
@@ -104,10 +106,16 @@
        (f 'src src (update-srcs-at! i))))])
 
 (define (instr-rename-vreg! ins old-reg new-reg)
+  (define (rename-maybe val set-val!)
+    (when (and (vreg? val) (eq? old-reg val))
+      (set-val! new-reg)))
   (instr-visit-operands ins
                         (lambda (type val set-val!)
-                          (when (and (vreg? val) (eq? old-reg val))
-                            (set-val! new-reg)))))
+                          (match type
+                            [(or 'src 'dst 'inout) (rename-maybe val set-val!)]
+                            ['mem (mem-visit-operands val (lambda (t val set-val!)
+                                                            (rename-maybe val set-val!)))]
+                            ['imm (void)]))))
 
 
 ;; vasm datastructure
@@ -187,7 +195,25 @@
 (define (unit-entry unit)
   (car (unit-labels unit)))
 
-(define current-unit (make-parameter #f))
+(define (unit-merge! u . others)
+  (define labels (append* (unit-labels u) (map unit-labels others)))
+  (define blocks (append* (unit-blocks u) (map unit-blocks others)))
+  (define vregs (append* (unit-vregs u) (map unit-vregs others)))
+  (define instrs (append* (unit-instrs u) (map unit-instrs others)))
+
+  (define (renumber unit-x set-id!)
+    (define xs (append* (unit-x u) (map unit-x others)))
+    (for ([x xs]
+          [id (in-naturals)])
+      (set-id! x id))
+    xs)
+
+  (unit
+    (renumber unit-labels set-label-id!)
+    (renumber unit-blocks set-block-id!)
+    (renumber unit-vregs set-vreg-id!)
+    (renumber unit-instrs set-vinstr-id!)))
+
 
 (define (block! unit . labels)
   (define blocks (unit-blocks unit))
@@ -266,7 +292,6 @@
   new-instr)
 
 (define (block-replace-range! u block start end new-ops)
-  (displayln `(replace ,start ,end ,new-ops))
   (define new-instrs (map (lambda (o)
                             (instr-raw! u o))
                           new-ops))
@@ -660,11 +685,12 @@
 
   ;; mark two vregs as being live at the same moment
   (define (add!-interferes-with graph v w)
-    (define (idx r) (hash-ref (iference-graph-label->idx graph) r))
-    (define adj (iference-graph-adjacency graph))
-    (when (not (eq? v w))
-      (vector-set! adj (idx v) (set-add (vector-ref adj (idx v)) (idx w)))
-      (vector-set! adj (idx w) (set-add (vector-ref adj (idx w)) (idx v)))))
+    (define (idx r) (hash-ref (iference-graph-label->idx graph) r #f))
+    (when (and (idx v) (idx w))
+      (define adj (iference-graph-adjacency graph))
+      (when (not (eq? v w))
+        (vector-set! adj (idx v) (set-add (vector-ref adj (idx v)) (idx w)))
+        (vector-set! adj (idx w) (set-add (vector-ref adj (idx w)) (idx v))))))
 
   (define (add!-affinity graph v w)
     (define weights (iference-graph-preference-weights graph))
@@ -680,17 +706,24 @@
       (when graph
         (add!-affinity graph v w))))
 
+  (define (interference-set regs graph)
+    (set-iference-graph-chromatic-number! graph
+                                          (max (length regs)
+                                               (iference-graph-chromatic-number graph)))
+    (for* ([v regs] [w regs]) (add!-interferes-with graph v w)))
+
+  ;; any registers in the must-color set interfere in all graphs
+  (define must-color-regs (map car required-colors))
+  (for ([(cls spec) (in-dict available-regs)])
+    (define g (hash-ref interference-graphs cls))
+    (when g
+      (interference-set must-color-regs g)))
+
   (define (visit-live regs block instr)
     (define (live-regs-with-class cls)
       (filter (lambda (r) (and (not (vreg-physical? r))
                                (eq? cls (storage-class r))))
               (set->list regs)))
-
-    (define (interference-set regs graph)
-      (set-iference-graph-chromatic-number! graph
-                                            (max (length regs)
-                                                 (iference-graph-chromatic-number graph)))
-      (for* ([v regs] [w regs]) (add!-interferes-with graph v w)))
 
     ;; for each register class
     (for ([(cls spec) (in-dict available-regs)])

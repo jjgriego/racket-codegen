@@ -2,6 +2,10 @@
 
 (require "asm.rkt")
 
+(provide movi add* sub* mov store load jcc cmp call* ret* push pop
+         enter-frame leave-frame
+         lower-x64 (struct-out mem))
+
 (define default-register-spec
   '((gp . (rax rcx rdx r8 r9 r10 r11 rsi rdi))
     (sf . (sf))
@@ -24,7 +28,15 @@
   #:methods gen:mem
   [(define (mem-srcs m)
      (filter identity (list (mem-offset m)
-                            (mem-index))))])
+                            (mem-index m))))
+   (define (mem-visit-operands m f)
+     (f 'imm (mem-base m) (lambda (v) (set-mem-base! m v)))
+     (when (mem-offset m)
+       (f 'src (mem-offset m) (lambda (v) (set-mem-offset! m v))))
+     (when (mem-index m)
+       (f 'src (mem-index m) (lambda (v) (set-mem-index! m v))))
+     (when (mem-scale m)
+       (f 'imm (mem-scale m) (lambda (v) (set-mem-scale! m v)))))])
 
 (define (stack-access n)
   (mem (* -8 (add1 n)) rbp #f #f))
@@ -111,14 +123,15 @@
       (add1 (apply max access-idxs))))
 
 (define (frame-register-constraints u)
-  (for*/first ([b (unit-blocks u)]
-               [i (block-instrs b)]
-               #:when (enter-frame? (vinstr-op i)))
-    (match (vinstr-op i)
-      [(enter-frame dsts)
-       (for/list ([r dsts]
-                  [pr '(rdi rsi rdx rcx r8 r9)])
-         (cons r pr))])))
+  (or (for*/first ([b (unit-blocks u)]
+                   [i (block-instrs b)]
+                   #:when (enter-frame? (vinstr-op i)))
+        (match (vinstr-op i)
+          [(enter-frame dsts)
+           (for/list ([r dsts]
+                      [pr '(rdi rsi rdx rcx r8 r9)])
+             (cons r pr))]))
+      '()))
 
 
 (define (lower-frame u registers)
@@ -287,7 +300,23 @@
       (write-instr (vinstr-op i))
       (display "\n"))))
 
-(module+ test
+(define (lower-x64 u)
+  (define must-colors (frame-register-constraints u))
+  (define allocs (regalloc u default-register-spec must-colors instr-storage-classes))
+  (unphi u
+         default-register-spec
+         (liveness u)
+         allocs
+         (phi-registers u))
+  (lower-call* u allocs)
+  (lower-frame u allocs)
+  (lower-copies u allocs)
+  (collapse-phys-regs u allocs x64-physregs)
+  (lower-return u)
+  (lower-three-address u)
+  (trivial-mov u))
+
+#;(module+ test
   (define u (asm-unit
              (n a b n0 a0 b0 t0 sf0 t1 n1 sum trash)
              (entry
@@ -309,25 +338,10 @@
               (add* a0 b0 sum)
               (phijmp loop-header (list n1 b0 sum)))
              (done
-              (call* 'print a0 trash)
               (leave-frame)
               (ret* a0))))
   (show-unit u)
-  (define must-colors (frame-register-constraints u))
-  (define allocs (regalloc u default-register-spec must-colors instr-storage-classes))
-  (unphi u
-         default-register-spec
-         (liveness u)
-         allocs
-         (phi-registers u))
-  (show-unit u allocs)
-  (lower-call* u allocs)
-  (lower-frame u allocs)
-  (lower-copies u allocs)
-  (collapse-phys-regs u allocs x64-physregs)
-  (lower-return u)
-  (lower-three-address u)
-  (trivial-mov u)
+  (lower-x64 u)
   (show-unit u)
   (write-unit-asm u))
 
