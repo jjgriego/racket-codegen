@@ -21,6 +21,7 @@
 
 (define-generics mem
   (mem-srcs mem)
+  (mem-operands mem)
   (mem-visit-operands mem f))
 
 (define-syntax (assert stx)
@@ -115,6 +116,7 @@
                             [(or 'src 'dst 'inout) (rename-maybe val set-val!)]
                             ['mem (mem-visit-operands val (lambda (t val set-val!)
                                                             (rename-maybe val set-val!)))]
+                            ['target (void)]
                             ['imm (void)]))))
 
 
@@ -1042,6 +1044,9 @@
            (vreg-display o)
            (if (empty? vreg-extra-data) "" ":")
            (show-extra-data o vreg-extra-data ":")))]
+        [(mem? o)
+         (format "(mem ~a)"
+                 (string-join (map format-operand (mem-operands o)) " "))]
         [(label? o) (format "-> B~a" (block-id (label-block o)))]
         [else (format "~a" o)]))
 

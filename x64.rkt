@@ -2,9 +2,10 @@
 
 (require "asm.rkt")
 
-(provide movi add* sub* mov store load jcc cmp call* ret* push pop
+(provide movi add* sub* mov store load jcc cmp call* calli* ret* push pop lea
          enter-frame leave-frame
-         lower-x64 (struct-out mem))
+         lower-x64 (struct-out mem)
+         write-unit-asm)
 
 (define default-register-spec
   '((gp . (rax rcx rdx r8 r9 r10 r11 rsi rdi))
@@ -29,6 +30,11 @@
   [(define (mem-srcs m)
      (filter identity (list (mem-offset m)
                             (mem-index m))))
+   (define (mem-operands m)
+     (filter identity (list (mem-base m)
+                            (mem-offset m)
+                            (mem-index m)
+                            (mem-scale m))))
    (define (mem-visit-operands m f)
      (f 'imm (mem-base m) (lambda (v) (set-mem-base! m v)))
      (when (mem-offset m)
@@ -47,19 +53,22 @@
 (define-instruction (mov src dst))
 (define-instruction (store src mem))
 (define-instruction (load mem dst))
+(define-instruction (lea mem dst))
 (define-instruction (jcc src imm target))
 (define-instruction (cmp src src dst))
-(define-instruction (call* imm src dst))
 (define-instruction (ret* src))
 (define-instruction (ret))
 (define-instruction (push src))
 (define-instruction (pop dst))
 
+(define-instruction (neg dst))
 (define-instruction (sub dst src))
+(define-instruction (xchg dst dst))
 (define-instruction (subi dst imm))
 (define-instruction (add dst src))
 (define-instruction (addi dst imm))
-(define-instruction (call imm))
+(define-instruction (calli imm))
+(define-instruction (call src))
 
 ;; pseudo-instructions
 (define-syntax instr:enter-frame '((listof dst)))
@@ -77,6 +86,47 @@
      (for ([dst (enter-frame-dsts i)]
            [i (in-naturals)])
        (f 'dst dst (update-dsts-at! i))))])
+
+(define-syntax instr:call* '(src (listof src) dst))
+(struct call* (callee srcs dst) #:mutable #:transparent
+  #:methods gen:instr
+  [(define (instr-mneumonic _) 'call*)
+   (define (instr-operands i) (append (list (call*-callee i))
+                                      (call*-srcs i)
+                                      (list (call*-dst i))))
+   (define (instr-srcs i) (cons (call*-callee i)
+                                 (call*-srcs i)))
+   (define (instr-dsts i) (list (call*-dst i)))
+   (define (instr-imms i) '())
+   (define (instr-targets i) '())
+   (define (instr-visit-operands i f)
+     (f 'src (call*-callee i) (lambda (x) (set-call*-callee! i x)))
+     (define ((update-srcs-at! idx) x)
+       (set-call*-srcs! i (list-set (call*-srcs i) idx x)))
+     (for ([src (call*-srcs i)]
+           [i (in-naturals)])
+       (f 'src src (update-srcs-at! i)))
+     (f 'dst (call*-dst i) (lambda (x) (set-call*-dst! i x))))])
+
+(define-syntax instr:calli* '(imm (listof src) dst))
+(struct calli* (callee srcs dst) #:mutable #:transparent
+  #:methods gen:instr
+  [(define (instr-mneumonic _) 'call*)
+   (define (instr-operands i) (append (list (calli*-callee i))
+                                      (calli*-srcs i)
+                                      (list (calli*-dst i))))
+   (define (instr-srcs i) (calli*-srcs i))
+   (define (instr-dsts i) (list (calli*-dst i)))
+   (define (instr-imms i) (list (calli*-callee i)))
+   (define (instr-targets i) '())
+   (define (instr-visit-operands i f)
+     (f 'imm (calli*-callee i) (lambda (x) (set-calli*-callee! i x)))
+     (define ((update-srcs-at! idx) x)
+       (set-calli*-srcs! i (list-set (calli*-srcs i) idx x)))
+     (for ([src (calli*-srcs i)]
+           [i (in-naturals)])
+       (f 'src src (update-srcs-at! i)))
+     (f 'dst (calli*-dst i) (lambda (x) (set-calli*-dst! i x))))])
 
 (define-instruction (leave-frame))
 
@@ -137,18 +187,21 @@
 (define (lower-frame u registers)
   (define spill-slots (count-spill-slots u registers))
 
+  (define-values (adjust-stack-ptr restore-stack-ptr)
+    (cond
+      [(= 0 spill-slots) (values '() '())]
+      [else (values (list (subi rsp (* 8 spill-slots)))
+                    (list (mov rbp rsp)))]))
+
   (unit-replace-instrs! u (lambda (op replace!)
                             (match (vinstr-op op)
                               [(enter-frame dsts)
-                               (replace! (list
-                                          (push rbp)
-                                          (mov rsp rbp)
-                                          (subi rsp (* 8 spill-slots))
-                                          ))]
+                               (replace! `(,(push rbp)
+                                           ,(mov rsp rbp)
+                                           ,@adjust-stack-ptr))]
                               [(leave-frame)
-                               (replace! (list
-                                          (mov rbp rsp)
-                                          (pop rbp)))]
+                               (replace! `(,@restore-stack-ptr
+                                           ,(pop rbp)))]
                               [_ (void)]))))
 
 (define (lower-call* u registers-ed)
@@ -174,37 +227,78 @@
 
   (unit-replace-instrs! u
                         (lambda (i replace!)
+                          (define (lower instr callee-srcs args dst)
+                            (define live-out (instr-live-out i))
+                            (define caller-save '(rax rcx rdx r8 r9 r10 r11))
+                            (define params '(rdi rsi rdx))
+                            (define live-allocs
+                              (map register (set->list live-out)))
+
+                            ;;; XXX: if the callee src is already in a caller-save register
+                            ;;; we just made the code worse by causing it to be shuffled to a
+                            ;;; different callee-save, but whatever
+                            (define callee-mapping
+                              (for/list ([src callee-srcs]
+                                         [r caller-save])
+                                (define src* (vreg! u))
+                                (set-register! src* r)
+                                (cons src src*)))
+
+                            (define param-regs
+                              (for/list ([src args]
+                                         [r params])
+                                (define reg (vreg! u))
+                                (set-register! reg r)
+                                reg))
+
+                            (define shuffle-callee-srcs
+                              (shuffle (lambda ()
+                                         ;; NB r11 will always be available because
+                                         ;; it can't be live and there's no way to have 7
+                                         ;; callee-srcs
+                                         (define r (vreg! u))
+                                         (set-register! r 'r11)
+                                         r)
+                                       register
+                                       (append args (map car callee-mapping))
+                                       (append param-regs (map cdr callee-mapping))))
+
+                            (for ([rename callee-mapping])
+                              (instr-rename-vreg! instr (car rename) (cdr rename)))
+
+                            (define spilled
+                              (filter (lambda (r)
+                                        (and (not (eq? r dst))
+                                             (not (eq? (register r) (register dst)))
+                                             (or (memq (register r) caller-save)
+                                                 (memq (register r) params))))
+                                      (set->list live-out)))
+                            (define slots (map (lambda (a)
+                                                 (define r (vreg! u))
+                                                 (set-register! r a)
+                                                 r)
+                                               (find-spills live-allocs (length spilled))))
+
+                            (define saves (map (lambda (r slot)
+                                                 (copy r slot))
+                                               spilled
+                                               slots))
+                            (define restores (map (lambda (r slot)
+                                                    (copy slot r))
+                                                  spilled
+                                                  slots))
+
+                            (replace! `(,@saves
+                                        ,@shuffle-callee-srcs
+                                        ,instr
+                                        ,(mov rax dst)
+                                        ,@restores)))
+
                           (match (vinstr-op i)
+                            [(calli* f src dst)
+                             (lower (calli f) '() src dst)]
                             [(call* f src dst)
-                             (define live-out (instr-live-out i))
-                             (define caller-save '(rax rcx rdx r8 r9 r10 r11))
-                             (define live-allocs
-                               (map register (set->list live-out)))
-                             (define spilled
-                               (filter (lambda (r)
-                                         (memq (register r) caller-save))
-                                       (set->list live-out)))
-                             (define slots (map (lambda (a)
-                                                  (define r (vreg! u))
-                                                  (set-register! r a)
-                                                  r)
-                                                (find-spills live-allocs (length spilled))))
-
-                             (define saves (map (lambda (r slot)
-                                                  (copy r slot))
-                                                spilled
-                                                slots))
-                             (define restores (map (lambda (r slot)
-                                                     (copy slot r))
-                                                   spilled
-                                                   slots))
-
-                             (replace! `(,@saves
-                                         ,(mov src rdi)
-                                         ,(call f)
-                                         ,(mov rax dst)
-                                         ,@restores))
-                             ]
+                             (lower (call f) (list f) src dst)]
                             [_ (void)]))))
 
 (define (lower-three-address u)
@@ -212,13 +306,25 @@
                         (lambda (op replace!)
                           (match (vinstr-op op)
                             [(add* s0 s1 dst)
-                             (replace! (list
-                                        (add s0 s1)
-                                        (mov s0 dst)))]
+                             ;;; XXX we have to do this nonsense b/c we can't clobber
+                             ;;; the source regs :/
+                             (replace! (cond [(eq? s1 dst)
+                                              (list (add s1 s0))]
+                                             [else
+                                              (list
+                                               (mov s0 dst)
+                                               (add s0 s1)
+                                               (xchg s0 dst))]))]
                             [(sub* s0 s1 dst)
-                             (replace! (list
-                                        (add s0 s1)
-                                        (mov s0 dst)))]
+                             (replace! (cond [(eq? s1 dst)
+                                              (list
+                                               (neg s1)
+                                               (add s1 s0))]
+                                             [else
+                                              (list
+                                               (mov s0 dst)
+                                               (sub s0 s1)
+                                               (xchg s0 dst))]))]
                             [_ (void)]))))
 
 (define (lower-return u)
@@ -233,6 +339,7 @@
   (unit-replace-instrs! u (lambda (op replace!)
                             (match (vinstr-op op)
                               [(mov r r) (replace! '())]
+                              [(xchg r r) (replace! '())]
                               [_ (void)]))))
 
 (define (lower-copies u registers-ed)
@@ -269,7 +376,9 @@
     (define (target t)
       (~a (label-name t)))
     (define (imm i)
-      (format "$~a" i))
+      (cond
+        [(symbol? i) (~a i)]
+        [(number? i) (format "$~a" i)]))
     (define (memory m)
       (match m
         [(mem base #f #f #f)
@@ -280,15 +389,18 @@
       [(push src) (printf "push ~a" (reg src))]
       [(pop dst) (printf "pop ~a" (reg dst))]
       [(mov src dst) (printf "mov ~a, ~a" (reg src) (reg dst))]
+      [(xchg a b) (printf "xchg ~a, ~a" (reg a) (reg b))]
       [(add inout s1) (printf "add ~a, ~a" (reg s1) (reg inout))]
       [(sub inout s1) (printf "sub ~a, ~a" (reg s1) (reg inout))]
       [(subi inout i) (printf "sub ~a, ~a" (imm i) (reg inout))]
-      [(subi inout i) (printf "add ~a, ~a" (imm i) (reg inout))]
+      [(neg inout) (printf "neg ~a" (reg inout))]
       [(movi i dst) (printf "mov ~a, ~a" (imm i) (reg dst))]
+      [(lea ptr dst) (printf "lea ~a, ~a" (memory ptr) (reg dst))]
       [(cmp s0 s1 _) (printf "cmp ~a, ~a" (reg s0) (reg s1))]
       [(store src dst) (printf "mov ~a, ~a" (reg src) (memory dst))]
       [(load src dst) (printf "mov ~a, ~a" (memory src) (reg dst))]
-      [(call t) (printf "call ~a" t)]
+      [(call t) (printf "call *~a" (reg t))] ;; whyyy at&t
+      [(calli t) (printf "call ~a" (imm t))]
       [(jcc _ 'Z t) (printf "jz ~a" (target t))]
       [(jmp t) (printf "jmp ~a" (target t))]
       [(ret) (printf "ret")]))
